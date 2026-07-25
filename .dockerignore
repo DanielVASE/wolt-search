@@ -1,0 +1,13 @@
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.log
+.git
+.gitignore
+.dockerignore
+job-logs
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

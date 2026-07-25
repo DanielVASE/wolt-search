@@ -1,0 +1,14 @@
+services:
+  wolt-il-search:
+    build: .
+    image: wolt-il-search:latest
+    ports:
+      - "8787:8787"
+    volumes:
+      - wolt-data:/data
+    environment:
+      - WOLT_IL_DB=/data/cache.db
+    restart: unless-stopped
+
+volumes:
+  wolt-data:

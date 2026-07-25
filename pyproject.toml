@@ -1,0 +1,24 @@
+[project]
+name = "wolt-il-search-mcp"
+version = "0.1.0"
+description = "Nationwide (Israel) Wolt venue + menu search, with a local cache and an MCP server front-end."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "fastmcp>=2.0",
+    "rapidfuzz>=3.6",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.scripts]
+wolt-il-refresh = "wolt_il_search.cli:main"
+wolt-il-search-mcp = "wolt_il_search.server:main"
+wolt-il-webui = "wolt_il_search.webapp:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
