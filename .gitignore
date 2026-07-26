@@ -10,3 +10,5 @@ job-logs/
 *.egg-info/
 build/
 dist/
+.env
+.env.*

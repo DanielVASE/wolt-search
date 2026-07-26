@@ -3,12 +3,21 @@ services:
     build: .
     image: wolt-il-search:latest
     ports:
-      - "8787:8787"
+      # Bound to localhost only: the admin API can start/stop crawl jobs with
+      # no auth, so it shouldn't be reachable from other devices on the LAN.
+      # (The app itself must still bind 0.0.0.0 *inside* the container — see
+      # Dockerfile CMD — that's just how Docker's port publishing works.)
+      # Change to "8787:8787" if you actually want LAN access.
+      - "127.0.0.1:8787:8787"
     volumes:
       - wolt-data:/data
     environment:
       - WOLT_IL_DB=/data/cache.db
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   wolt-data:

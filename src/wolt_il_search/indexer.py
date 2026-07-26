@@ -18,6 +18,7 @@ IL_COUNTRY_CODE = "IL"
 VENUE_RADIUS_METERS = 40000  # comfortably beyond any single Wolt IL region's extent
 DEFAULT_MENU_MAX_AGE_SECONDS = 7 * 24 * 3600
 RETAIL_TARGET = "isr_retail_gm"  # Wolt's "Stores Around You" vertical: electronics, general merchandise, home, florists, etc.
+GROCERY_TARGET = "g_retail_groceries"  # Wolt's grocery/convenience vertical (Wolt Market, AM:PM, etc.) — no "isr_" prefix, confirmed by probing the live API.
 
 
 def refresh_regions(client: WoltClient, cache: Cache) -> int:
@@ -93,6 +94,39 @@ def refresh_retail_venues(
     return total
 
 
+def refresh_grocery_venues(
+    client: WoltClient,
+    cache: Cache,
+    on_region_done: Callable[[str, int], None] | None = None,
+) -> int:
+    """Pull the grocery/convenience vertical (Wolt Market, AM:PM, mini-markets,
+    ...) per region. Separate front-page section from both restaurants and the
+    isr_retail_gm retail vertical — none of these venues appear in either.
+    """
+    regions = cache.list_regions()
+    if not regions:
+        raise RuntimeError("no regions cached — call refresh_regions() first")
+
+    total = 0
+    for region in regions:
+        target = f"{GROCERY_TARGET}:{region['slug']}"
+        try:
+            venues = client.list_venue_list(target, region["lat"], region["lon"])
+        except WoltClientError as e:
+            LOG.warning("grocery region %s failed: %s", region["slug"], e)
+            continue
+        for v in venues:
+            slug = v.get("slug")
+            if not slug:
+                continue
+            cache.upsert_venue(region["slug"], v)
+        cache.commit()
+        total += len(venues)
+        if on_region_done:
+            on_region_done(region["slug"], len(venues))
+    return total
+
+
 def parse_menu_items(data: dict) -> list[dict]:
     category_by_item_id: dict[str, str] = {}
     for cat in data.get("categories", []):
@@ -139,18 +173,22 @@ def parse_retail_items(raw_items: list[dict]) -> list[dict]:
     return parsed
 
 
-def refresh_electronics_items(
+def refresh_scraped_items(
     scraper: RetailScraper,
     cache: Cache,
     limit: int = 50,
     max_age_seconds: float = DEFAULT_MENU_MAX_AGE_SECONDS,
+    product_lines: tuple[str, ...] | None = None,
     on_venue_done: Callable[[str, int | None], None] | None = None,
 ) -> tuple[int, int]:
-    """Fetch item catalogs for electronics/computer retail venues via the HTML
-    category-page scraper (see retail_scraper.py) — the JSON assortment API
-    returns zero items for these, so `refresh_menus()` can't cover them.
+    """Fetch item catalogs via the HTML category-page scraper (see
+    retail_scraper.py) for venues whose JSON assortment API always returns
+    zero items — electronics and grocery, both loading_strategy="partial".
+    Pass product_lines=("electronics",) or ("grocery",) to run just one.
     """
-    candidates = cache.retail_catalog_venues_needing_menu(max_age_seconds=max_age_seconds, limit=limit)
+    candidates = cache.retail_catalog_venues_needing_menu(
+        max_age_seconds=max_age_seconds, limit=limit, product_lines=product_lines
+    )
     attempted = 0
     succeeded = 0
     for venue in candidates:
@@ -181,13 +219,14 @@ def refresh_empty_catalog_venues(
     cache: Cache,
     product_lines: tuple[str, ...] = ("general_merchandise", "home_and_diy"),
     limit: int = 50,
+    max_age_seconds: float = DEFAULT_MENU_MAX_AGE_SECONDS,
     on_venue_done: Callable[[str, int | None], None] | None = None,
 ) -> tuple[int, int]:
     """Follow-up pass for non-electronics retail venues that came back with
     zero items via the plain JSON path — those use loading_strategy="partial"
     too and need the same HTML scraper electronics venues do.
     """
-    candidates = cache.venues_with_empty_catalog(product_lines, limit=limit)
+    candidates = cache.venues_with_empty_catalog(product_lines, limit=limit, max_age_seconds=max_age_seconds)
     attempted = 0
     succeeded = 0
     for venue in candidates:

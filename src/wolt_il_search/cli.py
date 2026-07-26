@@ -16,11 +16,12 @@ from .cache import Cache
 from .client import WoltClient
 from .indexer import (
     DEFAULT_MENU_MAX_AGE_SECONDS,
-    refresh_electronics_items,
     refresh_empty_catalog_venues,
+    refresh_grocery_venues,
     refresh_menus,
     refresh_regions,
     refresh_retail_venues,
+    refresh_scraped_items,
     refresh_venues,
 )
 from .retail_scraper import RetailScraper
@@ -113,15 +114,51 @@ def cmd_electronics_items(args: argparse.Namespace) -> None:
         else:
             print(f"  {slug}: {item_count} items")
 
-    attempted, succeeded = refresh_electronics_items(
+    attempted, succeeded = refresh_scraped_items(
         scraper,
         cache,
         limit=args.limit,
         max_age_seconds=args.max_age_hours * 3600,
+        product_lines=("electronics",),
         on_venue_done=on_done,
     )
     cache.rebuild_search_index()
     print(f"attempted {attempted} electronics venues, {succeeded} succeeded")
+    print(f"cache now: {cache.counts()}")
+
+
+def cmd_grocery_venues(args: argparse.Namespace) -> None:
+    cache = Cache(args.db)
+    client = WoltClient(delay_seconds=args.delay)
+
+    def on_done(slug: str, count: int) -> None:
+        print(f"  {slug}: {count} grocery venues")
+
+    total = refresh_grocery_venues(client, cache, on_region_done=on_done)
+    cache.rebuild_search_index()
+    print(f"refreshed {total} grocery venue entries across all regions")
+
+
+def cmd_grocery_items(args: argparse.Namespace) -> None:
+    cache = Cache(args.db)
+    scraper = RetailScraper(delay_seconds=args.delay)
+
+    def on_done(slug: str, item_count: int | None) -> None:
+        if item_count is None:
+            print(f"  {slug}: FAILED")
+        else:
+            print(f"  {slug}: {item_count} items")
+
+    attempted, succeeded = refresh_scraped_items(
+        scraper,
+        cache,
+        limit=args.limit,
+        max_age_seconds=args.max_age_hours * 3600,
+        product_lines=("grocery",),
+        on_venue_done=on_done,
+    )
+    cache.rebuild_search_index()
+    print(f"attempted {attempted} grocery venues, {succeeded} succeeded")
     print(f"cache now: {cache.counts()}")
 
 
@@ -137,7 +174,12 @@ def cmd_retail_rescrape(args: argparse.Namespace) -> None:
             print(f"  {slug}: {item_count} items")
 
     attempted, succeeded = refresh_empty_catalog_venues(
-        scraper, cache, product_lines=product_lines, limit=args.limit, on_venue_done=on_done
+        scraper,
+        cache,
+        product_lines=product_lines,
+        limit=args.limit,
+        max_age_seconds=args.max_age_hours * 3600,
+        on_venue_done=on_done,
     )
     cache.rebuild_search_index()
     print(f"attempted {attempted} empty-catalog venues, {succeeded} succeeded")
@@ -165,7 +207,6 @@ def cmd_search(args: argparse.Namespace) -> None:
         min_rating=args.min_rating,
         product_line=args.product_line,
         max_results=args.max_results,
-        include_items=not args.no_items,
     )
     for r in results:
         status = "open" if r.online else "closed"
@@ -215,8 +256,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTML-scrape follow-up for non-electronics retail venues that came back empty via the plain JSON path",
     )
     p_rescrape.add_argument("--limit", type=int, default=50)
+    p_rescrape.add_argument("--max-age-hours", type=float, default=DEFAULT_MENU_MAX_AGE_SECONDS / 3600)
     p_rescrape.add_argument("--product-lines", default="general_merchandise,home_and_diy")
     p_rescrape.set_defaults(func=cmd_retail_rescrape)
+
+    sub.add_parser(
+        "grocery-venues", help="Refresh the grocery/convenience vertical (Wolt Market, AM:PM, ...) for every region"
+    ).set_defaults(func=cmd_grocery_venues)
+
+    p_grocery = sub.add_parser(
+        "grocery-items",
+        help="Fetch item catalogs for grocery/convenience venues (HTML scrape, same mechanism as electronics-items)",
+    )
+    p_grocery.add_argument("--limit", type=int, default=50, help="Max venues to fetch this run")
+    p_grocery.add_argument("--max-age-hours", type=float, default=DEFAULT_MENU_MAX_AGE_SECONDS / 3600)
+    p_grocery.set_defaults(func=cmd_grocery_items)
 
     sub.add_parser("reindex", help="Rebuild the FTS5 search index from current cache contents").set_defaults(
         func=cmd_reindex
@@ -231,7 +285,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--min-rating", type=float, default=None)
     p_search.add_argument("--product-line", default=None, help="e.g. restaurant, electronics, general_merchandise, home_and_diy")
     p_search.add_argument("--max-results", type=int, default=20)
-    p_search.add_argument("--no-items", action="store_true")
     p_search.set_defaults(func=cmd_search)
 
     return p

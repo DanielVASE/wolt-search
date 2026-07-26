@@ -93,7 +93,10 @@ def _tokenize(query: str) -> list[str]:
 
 
 def _fts_match_query(tokens: list[str], op: str) -> str:
-    return f" {op} ".join(f"{tok}*" for tok in tokens)
+    # Quoting each token forces FTS5 to treat it as a literal string rather
+    # than a query-syntax keyword — without this, a query like "not pizza"
+    # turns into an actual NOT operator and silently inverts the match.
+    return f" {op} ".join(f'"{tok}"*' for tok in tokens)
 
 
 @dataclass
@@ -390,7 +393,6 @@ def search(
     min_rating: float | None = None,
     product_line: str | None = None,
     max_results: int = 20,
-    include_items: bool = True,  # noqa: ARG001 - kept for backward compat, items are always searched now
 ) -> list[VenueResult]:
     """Back-compat single-region/single-category convenience wrapper. New
     code (the web UI) should use search_full() for facets, pagination, and

@@ -53,7 +53,6 @@ def search(
         Field(description="Restrict to one vertical, e.g. 'restaurant', 'electronics', 'general_merchandise', 'home_and_diy'"),
     ] = None,
     max_results: Annotated[int, Field(description="Max venues to return", ge=1, le=100)] = 20,
-    include_items: Annotated[bool, Field(description="Also match/return menu items, not just venues")] = True,
 ) -> list[dict[str, Any]]:
     cache = _cache()
     try:
@@ -65,7 +64,6 @@ def search(
             min_rating=min_rating,
             product_line=product_line,
             max_results=max_results,
-            include_items=include_items,
         )
         return [dataclasses.asdict(r) for r in results]
     finally:

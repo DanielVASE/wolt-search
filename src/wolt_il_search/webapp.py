@@ -11,6 +11,7 @@ tail from the admin page.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -26,25 +27,115 @@ from .search import SearchFilters, search_full
 DB_PATH = os.environ.get("WOLT_IL_DB")
 JOB_LOG_DIR = (Path(DB_PATH).parent if DB_PATH else DEFAULT_DB_PATH.parent) / "job-logs"
 
-JOB_SPECS: dict[str, list[str]] = {
-    "regions": ["regions"],
-    "venues": ["venues"],
-    "retail-venues": ["retail-venues"],
-    "menus": ["menus", "--limit", "{limit}", "--max-age-hours", "999999"],
-    "menus-retail": [
-        "menus",
-        "--limit",
-        "{limit}",
-        "--max-age-hours",
-        "999999",
-        "--product-lines",
-        "general_merchandise,home_and_diy",
-    ],
-    "electronics-items": ["electronics-items", "--limit", "{limit}", "--max-age-hours", "999999"],
-    "retail-rescrape": ["retail-rescrape", "--limit", "{limit}"],
-    "reindex": ["reindex"],
-    "full": ["full", "--menu-limit", "{limit}"],
+# Sections define both admin-UI grouping and the order you'd actually run
+# things in: quickstart (optional one-click bootstrap) -> setup (region/venue
+# discovery, must run before anything else) -> refresh (per-venue item
+# crawls, the ones you re-run periodically to pick up new/changed/removed
+# items) -> maintenance (rarely needed by hand).
+JOB_SPECS: dict[str, dict] = {
+    "full": {
+        "args": ["full", "--menu-limit", "{limit}"],
+        "section": "quickstart",
+        "description": "Regions + venues + a menu batch, in one shot — good for bootstrapping an empty cache",
+        "has_limit": True,
+        "default_limit": 200,
+        "heavy": True,
+    },
+    "regions": {
+        "args": ["regions"],
+        "section": "setup",
+        "description": "Refresh the 24 Israel region list",
+    },
+    "venues": {
+        "args": ["venues"],
+        "section": "setup",
+        "description": "Refresh restaurant venues (all regions)",
+    },
+    "retail-venues": {
+        "args": ["retail-venues"],
+        "section": "setup",
+        "description": "Refresh retail venues: electronics, general_merchandise, home_and_diy, ... (all regions)",
+    },
+    "grocery-venues": {
+        "args": ["grocery-venues"],
+        "section": "setup",
+        "description": "Refresh grocery/convenience venues: Wolt Market, AM:PM, mini-markets, ... (all regions)",
+    },
+    "menus": {
+        "args": ["menus", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
+        "section": "refresh",
+        "description": "Fetch/refresh restaurant menus (JSON path)",
+        "has_limit": True,
+        "has_max_age": True,
+        "default_limit": 200,
+        "default_max_age_hours": 168,
+        "heavy": True,
+    },
+    "menus-retail": {
+        "args": [
+            "menus",
+            "--limit",
+            "{limit}",
+            "--max-age-hours",
+            "{max_age_hours}",
+            "--product-lines",
+            "general_merchandise,home_and_diy",
+        ],
+        "section": "refresh",
+        "description": "Fetch/refresh general_merchandise/home_and_diy items (JSON path)",
+        "has_limit": True,
+        "has_max_age": True,
+        "default_limit": 200,
+        "default_max_age_hours": 168,
+        "heavy": True,
+    },
+    "electronics-items": {
+        "args": ["electronics-items", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
+        "section": "refresh",
+        "description": "Fetch/refresh electronics item catalogs (HTML scrape)",
+        "has_limit": True,
+        "has_max_age": True,
+        "default_limit": 50,
+        "default_max_age_hours": 168,
+        "heavy": True,
+    },
+    "retail-rescrape": {
+        "args": ["retail-rescrape", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
+        "section": "refresh",
+        "description": "Rescrape empty-catalog general_merchandise/home_and_diy venues (HTML scrape)",
+        "has_limit": True,
+        "has_max_age": True,
+        "default_limit": 50,
+        "default_max_age_hours": 168,
+        "heavy": True,
+    },
+    "grocery-items": {
+        "args": ["grocery-items", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
+        "section": "refresh",
+        "description": "Fetch/refresh grocery item catalogs (HTML scrape, same mechanism as electronics-items)",
+        "has_limit": True,
+        "has_max_age": True,
+        "default_limit": 50,
+        "default_max_age_hours": 168,
+        "heavy": True,
+    },
+    "reindex": {
+        "args": ["reindex"],
+        "section": "maintenance",
+        "description": (
+            "Rebuild the FTS5 search index — every refresh job above already does this on "
+            "completion, this is only for forcing a rebuild without running a crawl"
+        ),
+    },
 }
+
+SECTION_TITLES = {
+    "quickstart": "Quick start",
+    "setup": "1. Setup — region & venue discovery",
+    "refresh": "2. Refresh items — run periodically to pick up new/changed/removed items",
+    "maintenance": "3. Maintenance",
+}
+SECTION_ORDER = ["quickstart", "setup", "refresh", "maintenance"]
 
 
 class JobManager:
@@ -55,7 +146,7 @@ class JobManager:
         job = self.jobs.get(name)
         return bool(job and job["proc"].poll() is None)
 
-    def start(self, name: str, limit: int, delay: float) -> Path:
+    def start(self, name: str, limit: int, delay: float, max_age_hours: float) -> Path:
         if name not in JOB_SPECS:
             raise ValueError(f"unknown job: {name}")
         if self.is_running(name):
@@ -63,21 +154,30 @@ class JobManager:
 
         JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = JOB_LOG_DIR / f"{name}.log"
-        args = [a.format(limit=limit) for a in JOB_SPECS[name]]
+        args = [a.format(limit=limit, max_age_hours=max_age_hours) for a in JOB_SPECS[name]["args"]]
         cmd = [sys.executable, "-m", "wolt_il_search.cli", "--delay", str(delay)]
         if DB_PATH:
             cmd += ["--db", DB_PATH]
         cmd += args
 
-        log_file = open(log_path, "w")
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-        self.jobs[name] = {"proc": proc, "log_file": log_file, "log_path": log_path, "started_at": time.time()}
+        # Popen dup()s the fd into the child on launch, so the parent's handle
+        # can close immediately — holding it open in self.jobs would leak one
+        # fd per job start for the life of the webapp process.
+        with open(log_path, "w") as log_file:
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        self.jobs[name] = {"proc": proc, "log_path": log_path, "started_at": time.time()}
         return log_path
 
     def stop(self, name: str) -> bool:
         job = self.jobs.get(name)
         if job and self.is_running(name):
-            job["proc"].terminate()
+            proc = job["proc"]
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
             return True
         return False
 
@@ -204,13 +304,31 @@ def api_status() -> JSONResponse:
 
 
 @app.post("/api/jobs/{name}/start")
-def api_job_start(name: str, limit: int = 200, delay: float = 1.5) -> JSONResponse:
+def api_job_start(name: str, limit: int = 200, delay: float = 1.5, max_age_hours: float = 168.0) -> JSONResponse:
+    # Clamp rather than trust the caller: an admin API with no auth (see
+    # README) shouldn't let anyone on the same network disable rate limiting
+    # (delay=0), kick off an effectively-unbounded crawl, or set an age
+    # cutoff so large it never re-touches an already-fetched venue.
+    limit = max(1, min(limit, 5000))
+    delay = max(0.5, min(delay, 30.0))
+    max_age_hours = max(0.0, min(max_age_hours, 24 * 365))
     try:
-        job_manager.start(name, limit=limit, delay=delay)
+        job_manager.start(name, limit=limit, delay=delay, max_age_hours=max_age_hours)
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
+
+    # Remember these as this job's defaults for next time, so restarting
+    # after a stop doesn't mean re-typing the same limit/max-age/delay.
+    cache = _cache()
+    try:
+        cache.set_meta(
+            f"job_params:{name}",
+            json.dumps({"limit": limit, "max_age_hours": max_age_hours, "delay": delay}),
+        )
+    finally:
+        cache.close()
     return JSONResponse({"started": True})
 
 
@@ -234,6 +352,35 @@ def api_jobs() -> JSONResponse:
     return JSONResponse({name: job_manager.status(name) for name in JOB_SPECS})
 
 
+@app.get("/api/jobs/meta")
+def api_jobs_meta() -> JSONResponse:
+    """Per-job config (section, description, which controls apply, defaults)
+    — the admin page builds its whole layout from this rather than
+    hardcoding it a second time in JS. Defaults are whatever this job was
+    last started with, if it's ever been started, falling back to the
+    hardcoded JOB_SPECS default otherwise.
+    """
+    cache = _cache()
+    try:
+        result = {}
+        for name, spec in JOB_SPECS.items():
+            saved_raw = cache.get_meta(f"job_params:{name}")
+            saved = json.loads(saved_raw) if saved_raw else {}
+            result[name] = {
+                "section": spec["section"],
+                "description": spec["description"],
+                "has_limit": spec.get("has_limit", False),
+                "has_max_age": spec.get("has_max_age", False),
+                "default_limit": saved.get("limit", spec.get("default_limit", 200)),
+                "default_max_age_hours": saved.get("max_age_hours", spec.get("default_max_age_hours", 168.0)),
+                "default_delay": saved.get("delay", 1.5),
+                "heavy": spec.get("heavy", False),
+            }
+        return JSONResponse(result)
+    finally:
+        cache.close()
+
+
 @app.get("/", response_class=HTMLResponse)
 def search_page() -> str:
     return SEARCH_HTML
@@ -246,56 +393,40 @@ def admin_page() -> str:
 
 _BASE_CSS = r"""
 :root {
-  /* Palette pulled from wolt.com's own production CSS (static/themes/al/default.css):
-     --al-color-text-brand #009de0, --al-color-text #202125, --al-color-border #e4e4e5,
-     --al-color-bg-surface-secondary #f6f6f6, --al-color-text-positive #1fc70a,
-     --al-color-text-negative #f93a25, shadow recipe from --al-shadow-small. */
-  color-scheme: light;
-  --bg: #f6f6f6;
-  --surface: #ffffff;
-  --border: #e4e4e5;
-  --text: #202125;
-  --text-muted: #5c5d63;
-  --accent: #009de0;
-  --accent-hover: #0086bf;
-  --accent-soft: #ebf7fd;
-  --green: #1fc70a;
-  --green-soft: #eafcea;
-  --red: #f93a25;
-  --red-soft: #fdeceb;
+  /* Read directly off wolt.com's live computed styles (getComputedStyle on
+     a real venue page, --al-color-* custom properties), not guessed or
+     reconstructed from a cached memory of an older palette. Wolt's current
+     dark theme is a navy-tinted dark, not pure black.
+     Structural chrome (topbar, sidebar, item cards) uses Wolt's secondary
+     surface tone (--al-color-bg-surface-secondary), a level above the
+     page's own background — not identical to it, and not the brighter
+     --al-color-bg-surface either. Card/panel borders are dropped in favor
+     of that subtle tone shift plus shadow for separation. */
+  color-scheme: dark;
+  --bg: #0a0c17;
+  --surface: #161929;
+  --border: #3b415e;
+  --text: #e3deda;
+  --text-muted: #949ab9;
+  --accent: #54bce1;
+  --accent-hover: #71d2f6;
+  --accent-fill: #71d2f6;
+  --accent-fill-hover: #54bce1;
+  --text-on-accent: #010f15;
+  --accent-soft: #04232e;
+  --green: #65c466;
+  --green-soft: #09250a;
+  --red: #ff9280;
+  --red-soft: #460603;
   --radius: 16px;
   --radius-sm: 10px;
-  --shadow: 0 0 1px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.08);
+  --shadow: 0 0 1px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.4), 0 8px 20px rgba(0,0,0,.5);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Arimo", "Open Sans", sans-serif;
 }
-:root[data-theme="dark"] {
-  /* Wolt's dark theme runs pure black, not dark-gray. */
-  color-scheme: dark;
-  --bg: #000000;
-  --surface: #171719;
-  --border: #2c2c2e;
-  --text: #f2f2f2;
-  --text-muted: #9a9a9e;
-  --accent: #1fb8f0;
-  --accent-hover: #4fc6f2;
-  --accent-soft: #001924;
-  --green: #3ddc25;
-  --green-soft: #06210a;
-  --red: #ff5c47;
-  --red-soft: #2a0e0b;
-  --shadow: 0 0 1px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.4), 0 8px 20px rgba(0,0,0,.5);
-}
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.45; transition: background 0.15s, color 0.15s; }
+body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.45; }
 a { color: var(--accent); }
 [dir="auto"] { unicode-bidi: plaintext; }
-
-.theme-toggle {
-  background: var(--surface); border: 1px solid var(--border); color: var(--text);
-  border-radius: 999px; width: 2.1rem; height: 2.1rem; cursor: pointer; font-size: 1rem;
-  display: inline-flex; align-items: center; justify-content: center; padding: 0;
-}
-.theme-toggle:hover { border-color: var(--accent); }
 
 .topbar {
   background: var(--surface); border-bottom: 1px solid var(--border);
@@ -315,7 +446,7 @@ a { color: var(--accent); }
   #mainCol { order: 1; }
 }
 
-.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.panel { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow); }
 .panel + .panel { margin-top: 1rem; }
 .panel-header {
   display: block; padding: 0.8rem 1rem; border-bottom: 1px solid var(--border); font-weight: 600;
@@ -366,21 +497,26 @@ details:not([open]) > .panel-header { border-bottom: none; }
 .facet-count { color: var(--text-muted); font-size: 0.78rem; }
 
 .searchbar { display: flex; gap: 0.6rem; margin-bottom: 1rem; }
-.searchbar input[type="text"] {
-  flex: 1; padding: 0.75rem 1.1rem; font-size: 1rem; border: 1px solid var(--border);
-  border-radius: 999px; background: var(--surface); color: var(--text);
+.search-input-wrap { position: relative; flex: 1; }
+.search-icon {
+  position: absolute; left: 0.95rem; top: 50%; transform: translateY(-50%);
+  width: 1.1rem; height: 1.1rem; color: var(--text-muted); pointer-events: none;
 }
-.searchbar input[type="text"]:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+.searchbar input[type="text"] {
+  width: 100%; padding: 0.75rem 1.1rem 0.75rem 2.6rem; font-size: 1rem; border: none;
+  border-radius: var(--radius); background: var(--surface); color: var(--text);
+}
+.searchbar input[type="text"]:focus { outline: 2px solid var(--accent); }
 button.primary {
-  background: var(--accent); color: #fff; border: none; border-radius: 999px;
+  background: var(--accent-fill); color: var(--text-on-accent); border: none; border-radius: 999px;
   padding: 0.75rem 1.5rem; font-size: 0.95rem; font-weight: 700; cursor: pointer;
 }
-button.primary:hover { background: var(--accent-hover); }
+button.primary:hover { background: var(--accent-fill-hover); }
 
 .result-meta { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.9rem; }
 
 .venue-card {
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); border-radius: var(--radius);
   box-shadow: var(--shadow); padding: 0.9rem 1.1rem; margin-bottom: 0.8rem;
 }
 .venue-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.6rem; }
@@ -427,7 +563,6 @@ SEARCH_HTML = r"""<!doctype html>
   <div class="brand">Wolt IL <span class="dot">Search</span></div>
   <div style="display:flex; align-items:center; gap:1rem;">
     <span class="stats" id="headerStats"></span>
-    <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode">&#127769;</button>
     <nav><a href="/admin">Admin &rarr;</a></nav>
   </div>
 </div>
@@ -504,7 +639,10 @@ SEARCH_HTML = r"""<!doctype html>
 
   <div id="mainCol">
     <div class="searchbar">
-      <input type="text" id="q" placeholder="Search venues and items nationwide..." autofocus>
+      <div class="search-input-wrap">
+        <svg class="search-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><line x1="13.2" y1="13.2" x2="17.5" y2="17.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <input type="text" id="q" placeholder="Search venues and items nationwide..." autofocus>
+      </div>
       <button class="primary" id="go">Search</button>
     </div>
     <div class="result-meta" id="resultMeta"></div>
@@ -514,21 +652,6 @@ SEARCH_HTML = r"""<!doctype html>
 </div>
 
 <script>
-function applyTheme(theme) {
-  document.documentElement.setAttribute('data-theme', theme);
-  const icon = theme === 'dark' ? '☀️' : '🌙';
-  document.getElementById('themeToggle').innerHTML = `<span aria-hidden="true">${icon}</span>`;
-  localStorage.setItem('wolt-il-theme', theme);
-}
-(function initTheme() {
-  const saved = localStorage.getItem('wolt-il-theme');
-  const theme = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  applyTheme(theme);
-})();
-document.getElementById('themeToggle').addEventListener('click', () => {
-  applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
-});
-
 const PAGE_SIZE = 20;
 let currentOffset = 0;
 let currentTotal = 0;
@@ -545,6 +668,7 @@ const PL_LABELS = {
   restaurant: 'Restaurants', electronics: 'Electronics', general_merchandise: 'General Merchandise',
   home_and_diy: 'Home & DIY', florist: 'Florist', pet_supply: 'Pet Supply',
   toys_games_and_kids: 'Toys & Kids', pharmacy: 'Pharmacy', health_and_beauty: 'Health & Beauty',
+  grocery: 'Grocery',
 };
 function humanizeLabel(v) { return PL_LABELS[v] || v; }
 
@@ -786,26 +910,53 @@ ADMIN_HTML = r"""<!doctype html>
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--border); font-size: 0.88rem; }
   th { color: var(--text-muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
-  button.start { background: var(--green); color: white; border: none; border-radius: 999px; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 700; }
-  button.stop { background: var(--red); color: white; border: none; border-radius: 999px; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 700; }
-  input.limit { width: 4.5rem; padding: 0.35rem; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  button.start { background: var(--green); color: white; border: none; border-radius: 999px; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 700; white-space: nowrap; }
+  button.stop { background: var(--red); color: white; border: none; border-radius: 999px; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 700; white-space: nowrap; }
   .dot-status { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.4rem; }
   .dot-status.running { background: var(--green); }
   .dot-status.idle { background: #b0b3b8; }
+  .dot-status.done { background: var(--accent); }
   .dot-status.failed { background: var(--red); }
-  pre { background: #0d1117; color: #d1d5db; padding: 0.7rem; border-radius: 8px; max-height: 260px; overflow: auto; font-size: 0.78rem; display: none; margin: 0.4rem 0 0 0; }
+  pre { background: #0d1117; color: #d1d5db; padding: 0.7rem; border-radius: 8px; max-height: 260px; overflow: auto; font-size: 0.78rem; display: none; margin: 0.5rem 0 0.8rem 0; }
   pre.shown { display: block; }
   .toggle-log { font-size: 0.78rem; cursor: pointer; color: var(--accent); background: none; border: none; padding: 0; font-family: inherit; }
   .toggle-log:focus-visible { outline: 2px solid var(--accent); border-radius: 2px; }
   button.start:disabled, button.stop:disabled, .load-more:disabled { opacity: 0.6; cursor: not-allowed; }
   .job-desc { color: var(--text-muted); font-size: 0.78rem; margin-top: 0.15rem; }
+
+  .job-section-title { font-weight: 700; font-size: 0.9rem; margin: 1.5rem 0 0.4rem; }
+  .job-section-title:first-child { margin-top: 0; }
+  .job-row-flex {
+    display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem;
+    padding: 0.9rem 0; border-bottom: 1px solid var(--border);
+  }
+  .job-row-flex:last-of-type { border-bottom: none; }
+  .job-info { flex: 1 1 220px; min-width: 200px; }
+  .job-controls-row { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+  .job-controls-row .field { margin-bottom: 0; }
+  .job-controls-row .field label { margin-bottom: 0.2rem; white-space: nowrap; }
+  .job-controls-row .field input { width: 5.5rem; padding: 0.35rem 0.4rem; font-size: 0.85rem; }
+  .job-status-row { flex: 0 1 170px; min-width: 150px; font-size: 0.85rem; }
+  .job-actions-row { display: flex; align-items: center; }
+  .info-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 0.95rem; height: 0.95rem; border-radius: 50%; position: relative;
+    background: var(--border); color: var(--text-muted); font-size: 0.65rem; font-weight: 700;
+    cursor: help; margin-left: 0.15rem; flex-shrink: 0; vertical-align: middle;
+  }
+  .info-icon:hover::after, .info-icon:focus-visible::after {
+    content: attr(data-tip); position: absolute; bottom: 135%; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 0.4rem 0.6rem; border-radius: 6px;
+    font-size: 0.72rem; font-weight: 400; white-space: normal; width: 14rem;
+    box-shadow: var(--shadow); z-index: 20; pointer-events: none;
+  }
+  .info-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>
 </head>
 <body>
 <div class="topbar">
   <div class="brand">Wolt IL <span class="dot">Search</span></div>
   <div style="display:flex; align-items:center; gap:1rem;">
-    <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode">&#127769;</button>
     <nav><a href="/">&larr; Search</a></nav>
   </div>
 </div>
@@ -822,47 +973,80 @@ ADMIN_HTML = r"""<!doctype html>
   </div>
   <div class="panel">
     <div class="panel-header">Crawl jobs</div>
-    <div class="panel-body">
-      <table>
-        <thead><tr><th>Job</th><th>Status</th><th>Limit</th><th></th></tr></thead>
-        <tbody id="jobsTable"></tbody>
-      </table>
-    </div>
+    <div class="panel-body" id="jobSections"></div>
   </div>
 </div>
 
 <script>
-function applyTheme(theme) {
-  document.documentElement.setAttribute('data-theme', theme);
-  const icon = theme === 'dark' ? '☀️' : '🌙';
-  document.getElementById('themeToggle').innerHTML = `<span aria-hidden="true">${icon}</span>`;
-  localStorage.setItem('wolt-il-theme', theme);
-}
-(function initTheme() {
-  const saved = localStorage.getItem('wolt-il-theme');
-  const theme = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  applyTheme(theme);
-})();
-document.getElementById('themeToggle').addEventListener('click', () => {
-  applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
-});
-
-const JOB_DESCRIPTIONS = {
-  'regions': 'Refresh the 24 Israel region list',
-  'venues': 'Refresh restaurant venues (all regions)',
-  'retail-venues': 'Refresh retail venues: electronics, general_merchandise, home_and_diy, ... (all regions)',
-  'menus': 'Fetch restaurant menus (JSON path)',
-  'menus-retail': 'Fetch general_merchandise/home_and_diy items (JSON path)',
-  'electronics-items': 'Fetch electronics item catalogs (HTML scrape)',
-  'retail-rescrape': 'Rescrape empty-catalog general_merchandise/home_and_diy venues (HTML scrape)',
-  'reindex': 'Rebuild the FTS5 search index',
-  'full': 'Regions + venues + a menu batch, in one shot',
+const SECTION_TITLES = {
+  quickstart: 'Quick start',
+  setup: '1. Setup — region &amp; venue discovery',
+  refresh: '2. Refresh items — run periodically to pick up new/changed/removed items',
+  maintenance: '3. Maintenance',
 };
-const NO_LIMIT_JOBS = new Set(['reindex', 'regions', 'venues', 'retail-venues']);
-// These hit Wolt for many venues and can run for minutes — confirm before starting.
-const HEAVY_JOBS = new Set(['menus', 'menus-retail', 'electronics-items', 'retail-rescrape', 'full']);
+const SECTION_ORDER = ['quickstart', 'setup', 'refresh', 'maintenance'];
+
+let jobsMeta = {};  // name -> {section, description, has_limit, has_max_age, default_limit, default_max_age_hours, heavy}, loaded once
 
 function fmtStarted(ts) { return ts ? new Date(ts * 1000).toLocaleTimeString() : ''; }
+
+const FIELD_TIPS = {
+  limit: 'Max number of venues to process in this one run.',
+  maxage: 'Only re-fetch venues whose data is older than this many hours. Lower catches price/availability changes and removed items sooner; higher (or very large) skips anything fetched recently.',
+  delay: 'Seconds to wait between requests to Wolt, so this crawl doesn’t hammer their servers.',
+};
+function infoIcon(key) {
+  return `<span class="info-icon" tabindex="0" data-tip="${FIELD_TIPS[key]}">ⓘ</span>`;
+}
+
+// The status poll rebuilds every job row's HTML from scratch every 5s, which
+// would otherwise silently overwrite anything you'd typed into these inputs
+// before hitting Start. Read whatever's currently on screen first, and only
+// fall back to the server-remembered default for a row's very first render.
+function currentInputValue(id, fallback) {
+  const el = document.getElementById(id);
+  return el ? el.value : fallback;
+}
+
+function jobRowHtml(name, meta, s) {
+  const dotClass = s.running ? 'running' : (s.returncode == null ? 'idle' : (s.returncode === 0 ? 'done' : 'failed'));
+  const label = s.running ? `running since ${fmtStarted(s.started_at)}`
+    : (s.returncode != null ? `exited (code ${s.returncode})` : 'idle');
+  const logShown = document.getElementById(`log-${name}`)?.classList.contains('shown');
+
+  const limitVal = currentInputValue(`limit-${name}`, meta.default_limit);
+  const maxAgeVal = currentInputValue(`maxage-${name}`, meta.default_max_age_hours);
+  const delayVal = currentInputValue(`delay-${name}`, meta.default_delay);
+
+  const controls = [];
+  if (meta.has_limit) {
+    controls.push(`<div class="field"><label for="limit-${name}">Limit${infoIcon('limit')}</label><input type="number" min="1" id="limit-${name}" value="${limitVal}"></div>`);
+  }
+  if (meta.has_max_age) {
+    controls.push(`<div class="field"><label for="maxage-${name}">Max age (h)${infoIcon('maxage')}</label><input type="number" min="0" id="maxage-${name}" value="${maxAgeVal}"></div>`);
+  }
+  controls.push(`<div class="field"><label for="delay-${name}">Delay (s)${infoIcon('delay')}</label><input type="number" min="0.5" step="0.1" id="delay-${name}" value="${delayVal}"></div>`);
+
+  const html = `
+    <div class="job-row-flex" data-job="${name}">
+      <div class="job-info"><strong>${name}</strong><div class="job-desc">${meta.description}</div></div>
+      <div class="job-controls-row">${controls.join('')}</div>
+      <div class="job-status-row">
+        <span class="dot-status ${dotClass}"></span>${label}<br>
+        <button type="button" class="toggle-log" id="toggle-log-${name}" onclick="toggleLog('${name}')">${logShown ? 'hide log' : 'show log'}</button>
+      </div>
+      <div class="job-actions-row">${s.running
+        ? `<button class="stop" onclick="stopJob('${name}')">Stop</button>`
+        : `<button class="start" onclick="startJob('${name}')">Start</button>`}</div>
+    </div>
+    <pre id="log-${name}" class="${logShown ? 'shown' : ''}"></pre>
+  `;
+  return { html, logShown };
+}
+
+async function loadJobsMeta() {
+  jobsMeta = await (await fetch('/api/jobs/meta')).json();
+}
 
 async function refreshStatus() {
   const status = await (await fetch('/api/status')).json();
@@ -876,36 +1060,46 @@ async function refreshStatus() {
     <tr><td>${p.product_line ?? '(none)'}</td><td>${p.total.toLocaleString()}</td><td>${p.fetched.toLocaleString()}</td></tr>
   `).join('');
 
-  const jobsBody = document.getElementById('jobsTable');
-  jobsBody.innerHTML = Object.entries(status.jobs).map(([name, s]) => {
-    const dotClass = s.running ? 'running' : (s.returncode ? 'failed' : 'idle');
-    const label = s.running ? `running since ${fmtStarted(s.started_at)}`
-      : (s.returncode != null ? `exited (code ${s.returncode})` : 'idle');
-    const logShown = document.getElementById(`log-${name}`)?.classList.contains('shown');
-    return `
-    <tr class="job-row" data-job="${name}">
-      <td><strong>${name}</strong><div class="job-desc">${JOB_DESCRIPTIONS[name] || ''}</div></td>
-      <td><span class="dot-status ${dotClass}"></span>${label}<br><button type="button" class="toggle-log" id="toggle-log-${name}" onclick="toggleLog('${name}')">${logShown ? 'hide log' : 'show log'}</button></td>
-      <td>${NO_LIMIT_JOBS.has(name) ? '' : '<input type="number" class="limit" value="200" aria-label="Limit for ' + name + '">'}</td>
-      <td>${s.running
-        ? `<button class="stop" onclick="stopJob('${name}')">Stop</button>`
-        : `<button class="start" onclick="startJob('${name}')">Start</button>`}</td>
-    </tr>
-    <tr><td colspan="4"><pre id="log-${name}" class="${logShown ? 'shown' : ''}"></pre></td></tr>
-  `;
-  }).join('');
+  const bySection = {};
+  SECTION_ORDER.forEach(sec => { bySection[sec] = []; });
+  Object.keys(jobsMeta).forEach(name => { bySection[jobsMeta[name].section]?.push(name); });
+
+  const shownLogs = [];
+  document.getElementById('jobSections').innerHTML = SECTION_ORDER
+    .filter(sec => bySection[sec].length)
+    .map(sec => {
+      const rows = bySection[sec].map(name => {
+        const { html, logShown } = jobRowHtml(name, jobsMeta[name], status.jobs[name]);
+        if (logShown) shownLogs.push(name);
+        return html;
+      }).join('');
+      return `<div class="job-section-title">${SECTION_TITLES[sec]}</div>${rows}`;
+    }).join('');
+
+  // The <pre> above is rebuilt empty every poll — refill any pane that was open.
+  shownLogs.forEach(async (name) => {
+    const data = await (await fetch(`/api/jobs/${name}/log?lines=100`)).json();
+    const pre = document.getElementById(`log-${name}`);
+    if (pre) pre.textContent = data.log || '(no output yet)';
+  });
 }
 
 async function startJob(name) {
-  if (HEAVY_JOBS.has(name) && !confirm(`Start "${name}"? This hits Wolt for many venues and can run for several minutes.`)) {
+  const meta = jobsMeta[name];
+  if (meta.heavy && !confirm(`Start "${name}"? This hits Wolt for many venues and can run for several minutes.`)) {
     return;
   }
-  const row = document.querySelector(`tr[data-job="${name}"]`);
-  const limitInput = row.querySelector('.limit');
-  const limit = limitInput ? limitInput.value : 200;
-  const btn = row.querySelector('button.start');
+  const params = new URLSearchParams();
+  const limitInput = document.getElementById(`limit-${name}`);
+  const maxAgeInput = document.getElementById(`maxage-${name}`);
+  const delayInput = document.getElementById(`delay-${name}`);
+  if (limitInput) params.set('limit', limitInput.value);
+  if (maxAgeInput) params.set('max_age_hours', maxAgeInput.value);
+  if (delayInput) params.set('delay', delayInput.value);
+
+  const btn = document.querySelector(`.job-row-flex[data-job="${name}"] button.start`);
   if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
-  await fetch(`/api/jobs/${name}/start?limit=${limit}&delay=1.5`, { method: 'POST' });
+  await fetch(`/api/jobs/${name}/start?${params}`, { method: 'POST' });
   refreshStatus();
 }
 
@@ -928,8 +1122,11 @@ async function toggleLog(name) {
   if (btn) btn.textContent = 'hide log';
 }
 
-refreshStatus();
-setInterval(refreshStatus, 5000);
+(async function init() {
+  await loadJobsMeta();
+  await refreshStatus();
+  setInterval(refreshStatus, 5000);
+})();
 </script>
 </body>
 </html>

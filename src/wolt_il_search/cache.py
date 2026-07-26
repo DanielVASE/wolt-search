@@ -185,10 +185,11 @@ class Cache:
     def get_venue(self, slug: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM venues WHERE slug = ?", (slug,)).fetchone()
 
-    # Electronics venues always use loading_strategy="partial" (see
-    # retail_scraper.py) — the consumer-assortment JSON API returns zero items
-    # for them regardless, so they're always routed to the HTML scraper and
-    # excluded here to keep the two "needing menu" queries mutually exclusive.
+    # Electronics and grocery venues always use loading_strategy="partial"
+    # (see retail_scraper.py) — the consumer-assortment JSON API returns zero
+    # items for them regardless, so they're always routed to the HTML
+    # scraper and excluded here to keep the two "needing menu" queries
+    # mutually exclusive.
     #
     # general_merchandise (clothing/accessories) and home_and_diy
     # (furniture/home/decor) are a *mix* of loading strategies — most work
@@ -201,6 +202,8 @@ class Cache:
         OR lower(tags) LIKE '%"electronics"%'
         OR lower(tags) LIKE '%"computer"%'
     )"""
+    _IS_GROCERY_SQL = "lower(product_line) = 'grocery'"
+    _NEEDS_HTML_SCRAPER_SQL = f"({_IS_ELECTRONICS_SQL} OR {_IS_GROCERY_SQL})"
 
     def venues_needing_menu(
         self, max_age_seconds: float, limit: int, product_lines: tuple[str, ...] | None = None
@@ -216,7 +219,7 @@ class Cache:
             f"""
             SELECT * FROM venues
             WHERE (menu_fetched_at IS NULL OR menu_fetched_at < ?)
-              AND NOT {self._IS_ELECTRONICS_SQL}
+              AND NOT {self._NEEDS_HTML_SCRAPER_SQL}
               {product_line_filter}
             ORDER BY menu_fetched_at IS NOT NULL, menu_fetched_at ASC
             LIMIT ?
@@ -224,33 +227,52 @@ class Cache:
             (*params, limit),
         ).fetchall()
 
-    def retail_catalog_venues_needing_menu(self, max_age_seconds: float, limit: int) -> list[sqlite3.Row]:
+    def retail_catalog_venues_needing_menu(
+        self, max_age_seconds: float, limit: int, product_lines: tuple[str, ...] | None = None
+    ) -> list[sqlite3.Row]:
+        """Venues needing the HTML-scraper item crawl — electronics and
+        grocery by default, narrowable to just one via product_lines.
+        """
         cutoff = time.time() - max_age_seconds
+        product_line_filter = ""
+        params: tuple = (cutoff,)
+        if product_lines:
+            placeholders = ",".join("?" for _ in product_lines)
+            product_line_filter = f"AND product_line IN ({placeholders})"
+            params = (cutoff, *product_lines)
         return self.conn.execute(
             f"""
             SELECT * FROM venues
             WHERE (menu_fetched_at IS NULL OR menu_fetched_at < ?)
-              AND {self._IS_ELECTRONICS_SQL}
+              AND {self._NEEDS_HTML_SCRAPER_SQL}
+              {product_line_filter}
             ORDER BY menu_fetched_at IS NOT NULL, menu_fetched_at ASC
             LIMIT ?
             """,
-            (cutoff, limit),
+            (*params, limit),
         ).fetchall()
 
-    def venues_with_empty_catalog(self, product_lines: tuple[str, ...], limit: int) -> list[sqlite3.Row]:
+    def venues_with_empty_catalog(
+        self, product_lines: tuple[str, ...], limit: int, max_age_seconds: float
+    ) -> list[sqlite3.Row]:
         """Venues already run through the plain JSON menu path that came back
         with zero items — candidates for the HTML scraper follow-up pass.
+
+        Gated by max_age_seconds like the sibling "needing menu" queries,
+        otherwise a venue that's genuinely empty (delisted, out of stock)
+        gets rescraped on every single run forever.
         """
+        cutoff = time.time() - max_age_seconds
         placeholders = ",".join("?" for _ in product_lines)
         return self.conn.execute(
             f"""
             SELECT v.* FROM venues v
             WHERE v.product_line IN ({placeholders})
-              AND v.menu_fetched_at IS NOT NULL
+              AND v.menu_fetched_at IS NOT NULL AND v.menu_fetched_at < ?
               AND NOT EXISTS (SELECT 1 FROM menu_items mi WHERE mi.venue_slug = v.slug)
             LIMIT ?
             """,
-            (*product_lines, limit),
+            (*product_lines, cutoff, limit),
         ).fetchall()
 
     def mark_menu_stale(self, slug: str) -> None:

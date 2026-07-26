@@ -17,7 +17,7 @@ wolt-il-search-mcp = "wolt_il_search.server:main"
 wolt-il-webui = "wolt_il_search.webapp:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

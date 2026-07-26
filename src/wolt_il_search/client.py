@@ -9,11 +9,17 @@ resumable crawl, not high-frequency scraping.
 from __future__ import annotations
 
 import random
+import re
 import time
 
 import requests
 
 BASE_URL = "https://consumer-api.wolt.com"
+
+# Wolt slugs are lowercase alphanumeric-with-hyphens. get_menu_live's slug
+# comes straight from an MCP caller, not Wolt's own API — reject anything
+# else before it becomes part of a URL path (e.g. "../" traversal attempts).
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -85,6 +91,8 @@ class WoltClient:
         return venues
 
     def get_assortment(self, slug: str) -> dict:
+        if not _SLUG_RE.fullmatch(slug):
+            raise WoltClientError(f"invalid venue slug: {slug!r}")
         return self._get(f"/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment")
 
     def list_venue_list(self, target: str, lat: float, lon: float) -> list[dict]:

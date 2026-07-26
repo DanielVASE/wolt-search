@@ -11,3 +11,8 @@ job-logs
 *.db-wal
 *.db-shm
 .DS_Store
+*.egg-info/
+build/
+dist/
+.env
+.env.*
