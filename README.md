@@ -147,6 +147,8 @@ automation.
 
 `http://localhost:8787/admin` — cache stats by category, and Start/Stop/log-tail controls for every crawl job in `cli.py`, so you never need a terminal to (re)build the cache. Job tracking is in-memory in the webapp process: a crawl you started keeps running if you close the tab, but restarting the webapp process itself (not the Docker container — a container restart kills the crawl too) orphans it from the admin UI's view.
 
+![Admin UI showing a running crawl job](docs/admin-screenshot.png)
+
 ## Using it standalone (no Claude needed)
 
 ```bash
