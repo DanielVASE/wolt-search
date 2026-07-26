@@ -2,6 +2,8 @@
 
 Nationwide Israel search over Wolt, without ever touching an address field.
 
+![Search UI showing faceted filters and results](docs/screenshot.png)
+
 ## Why this exists
 
 Wolt's own search only looks at the one delivery region tied to your current
