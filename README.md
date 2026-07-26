@@ -54,6 +54,15 @@ The SQLite cache, its FTS5 index, and job logs all live in the `/data`
 volume (`wolt-data` in `docker-compose.yml`), so `docker compose down` /
 image rebuilds don't lose indexed data — only `docker compose down -v` does.
 
+Tagged releases are also published as pre-built images to GitHub Container
+Registry (see `.github/workflows/docker-release.yml`), so you can skip the
+local build:
+
+```bash
+docker pull ghcr.io/danielvase/wolt-search:latest
+docker run -p 127.0.0.1:8787:8787 -v wolt-data:/data ghcr.io/danielvase/wolt-search:latest
+```
+
 ## Setup (without Docker)
 
 ```bash
