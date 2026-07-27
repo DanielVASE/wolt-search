@@ -1,207 +1,569 @@
 """Local web UI: a real search page (multi-select filters, price range,
 include/exclude shops, sort, honest result counts, clickable Wolt links)
-plus an admin page to start/stop/monitor the crawl jobs from cli.py.
+plus an admin page to create/monitor crawl jobs.
 
-Crawl jobs run as subprocesses of this server (same `wolt-il-refresh` CLI,
-invoked via `python -m wolt_il_search.cli ...`) so a page reload or browser
-close doesn't kill them, and their stdout/stderr goes to a log file you can
-tail from the admin page.
+The admin page is one job creator + one list of jobs, not a grid of fixed
+buttons. You pick categories (discovered from Wolt's own API), press Start,
+and the whole selection is crawled — no venue cap to set, with the tuning
+knobs folded into an "Advanced settings" disclosure for the rare case you
+want them.
+
+Crawl jobs run as subprocesses of this server (`python -m
+wolt_il_search.cli crawl ...`) so a page reload or browser close doesn't kill
+them. They emit NDJSON progress events on stdout, which this module folds
+into live per-job progress (phase, current venue, X/Y, ETA, retries) and
+persists to the `jobs` table so a webapp restart re-attaches instead of
+orphaning them.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
+import uuid
+from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .cache import DEFAULT_DB_PATH, Cache
+from .categories import build_catalog, discover
+from .client import WoltClient
 from .search import SearchFilters, search_full
+
+LOG = logging.getLogger("wolt_il_search.webapp")
 
 DB_PATH = os.environ.get("WOLT_IL_DB")
 JOB_LOG_DIR = (Path(DB_PATH).parent if DB_PATH else DEFAULT_DB_PATH.parent) / "job-logs"
 
-# Sections define both admin-UI grouping and the order you'd actually run
-# things in: quickstart (optional one-click bootstrap) -> setup (region/venue
-# discovery, must run before anything else) -> refresh (per-venue item
-# crawls, the ones you re-run periodically to pick up new/changed/removed
-# items) -> maintenance (rarely needed by hand).
-JOB_SPECS: dict[str, dict] = {
-    "full": {
-        "args": ["full", "--menu-limit", "{limit}"],
-        "section": "quickstart",
-        "description": "Regions + venues + a menu batch, in one shot — good for bootstrapping an empty cache",
-        "has_limit": True,
-        "default_limit": 200,
-        "heavy": True,
-    },
-    "regions": {
-        "args": ["regions"],
-        "section": "setup",
-        "description": "Refresh the 24 Israel region list",
-    },
-    "venues": {
-        "args": ["venues"],
-        "section": "setup",
-        "description": "Refresh restaurant venues (all regions)",
-    },
-    "retail-venues": {
-        "args": ["retail-venues"],
-        "section": "setup",
-        "description": "Refresh retail venues: electronics, general_merchandise, home_and_diy, ... (all regions)",
-    },
-    "grocery-venues": {
-        "args": ["grocery-venues"],
-        "section": "setup",
-        "description": "Refresh grocery/convenience venues: Wolt Market, AM:PM, mini-markets, ... (all regions)",
-    },
-    "menus": {
-        "args": ["menus", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
-        "section": "refresh",
-        "description": "Fetch/refresh restaurant menus (JSON path)",
-        "has_limit": True,
-        "has_max_age": True,
-        "default_limit": 200,
-        "default_max_age_hours": 168,
-        "heavy": True,
-    },
-    "menus-retail": {
-        "args": [
-            "menus",
-            "--limit",
-            "{limit}",
-            "--max-age-hours",
-            "{max_age_hours}",
-            "--product-lines",
-            "general_merchandise,home_and_diy",
-        ],
-        "section": "refresh",
-        "description": "Fetch/refresh general_merchandise/home_and_diy items (JSON path)",
-        "has_limit": True,
-        "has_max_age": True,
-        "default_limit": 200,
-        "default_max_age_hours": 168,
-        "heavy": True,
-    },
-    "electronics-items": {
-        "args": ["electronics-items", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
-        "section": "refresh",
-        "description": "Fetch/refresh electronics item catalogs (HTML scrape)",
-        "has_limit": True,
-        "has_max_age": True,
-        "default_limit": 50,
-        "default_max_age_hours": 168,
-        "heavy": True,
-    },
-    "retail-rescrape": {
-        "args": ["retail-rescrape", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
-        "section": "refresh",
-        "description": "Rescrape empty-catalog general_merchandise/home_and_diy venues (HTML scrape)",
-        "has_limit": True,
-        "has_max_age": True,
-        "default_limit": 50,
-        "default_max_age_hours": 168,
-        "heavy": True,
-    },
-    "grocery-items": {
-        "args": ["grocery-items", "--limit", "{limit}", "--max-age-hours", "{max_age_hours}"],
-        "section": "refresh",
-        "description": "Fetch/refresh grocery item catalogs (HTML scrape, same mechanism as electronics-items)",
-        "has_limit": True,
-        "has_max_age": True,
-        "default_limit": 50,
-        "default_max_age_hours": 168,
-        "heavy": True,
-    },
-    "reindex": {
-        "args": ["reindex"],
-        "section": "maintenance",
-        "description": (
-            "Rebuild the FTS5 search index — every refresh job above already does this on "
-            "completion, this is only for forcing a rebuild without running a crawl"
-        ),
-    },
-}
+#: Cap on simultaneously running crawls. Several jobs are useful (discover one
+#: vertical while items crawl for another), but every extra job multiplies the
+#: request rate against Wolt, which is exactly what the pacing logic exists to
+#: keep polite.
+MAX_CONCURRENT_JOBS = 3
 
-SECTION_TITLES = {
-    "quickstart": "Quick start",
-    "setup": "1. Setup — region & venue discovery",
-    "refresh": "2. Refresh items — run periodically to pick up new/changed/removed items",
-    "maintenance": "3. Maintenance",
-}
-SECTION_ORDER = ["quickstart", "setup", "refresh", "maintenance"]
+#: Display lines kept per job for the live log pane. Bounded so a multi-hour
+#: crawl can't grow the webapp's memory without limit; the full log is always
+#: on disk.
+LOG_TAIL_LINES = 500
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(value, high))
+
+
+@dataclasses.dataclass
+class CrawlParams:
+    """Validated, clamped crawl settings.
+
+    The admin API has no auth (see README) so nothing here trusts the caller:
+    every number is clamped and every category key is checked against the
+    live catalog before it can reach argv.
+    """
+
+    categories: list[str]
+    phases: tuple[str, ...] = ("discover", "items")
+    limit: int = 0  # 0 = the whole category, which is now the default
+    max_age_hours: float = 168.0
+    delay: float = 1.2
+    max_delay: float = 60.0
+    max_attempts: int = 4
+    force: bool = False
+
+    @classmethod
+    def from_request(cls, body: dict, valid_keys: set[str]) -> CrawlParams:
+        raw_categories = body.get("categories") or []
+        if isinstance(raw_categories, str):
+            raw_categories = [c for c in raw_categories.split(",") if c]
+        categories = [c for c in raw_categories if c in valid_keys]
+        if not categories:
+            raise HTTPException(400, "select at least one known category")
+
+        raw_phases = body.get("phases") or ["discover", "items"]
+        phases = tuple(p for p in raw_phases if p in ("discover", "items"))
+        if not phases:
+            raise HTTPException(400, "phases must include 'discover' and/or 'items'")
+
+        limit = int(body.get("limit") or 0)
+        return cls(
+            categories=categories,
+            phases=phases,
+            # Negative would be meaningless; 0 stays 0 (unbounded) and any
+            # positive value is capped so a typo can't queue a million venues.
+            limit=0 if limit <= 0 else int(_clamp(limit, 1, 100_000)),
+            max_age_hours=_clamp(float(body.get("max_age_hours", 168.0)), 0.0, 24 * 365),
+            # Pacing floor stays >= 0.5s: this is a politeness guarantee
+            # toward Wolt, not a user preference.
+            delay=_clamp(float(body.get("delay", 1.2)), 0.5, 30.0),
+            max_delay=_clamp(float(body.get("max_delay", 60.0)), 5.0, 300.0),
+            max_attempts=int(_clamp(int(body.get("max_attempts", 4)), 1, 8)),
+            force=bool(body.get("force", False)),
+        )
+
+    def to_argv(self) -> list[str]:
+        argv = [
+            "--delay",
+            str(self.delay),
+            "--max-delay",
+            str(self.max_delay),
+            "--max-attempts",
+            str(self.max_attempts),
+            "crawl",
+            "--categories",
+            ",".join(self.categories),
+            "--phases",
+            ",".join(self.phases),
+            "--limit",
+            str(self.limit),
+            "--max-age-hours",
+            str(self.max_age_hours),
+            "--progress",
+            "json",
+        ]
+        if self.force:
+            argv.append("--force")
+        return argv
+
+
+class _Job:
+    """One crawl process plus the progress state derived from its output.
+
+    `proc` is None for a job this webapp process didn't start but re-attached
+    to after a restart (we have its pid from the DB but no Popen handle).
+    """
+
+    def __init__(self, job_id: str, kind: str, title: str, params: dict, log_path: Path, pid: int, proc=None):
+        self.id = job_id
+        self.kind = kind
+        self.title = title
+        self.params = params
+        self.log_path = log_path
+        self.pid = pid
+        self.proc = proc
+        self.created_at = time.time()
+        self.finished_at: float | None = None
+        self.returncode: int | None = None
+        self.state = "running"
+        self.offset = 0  # byte offset already consumed from the log
+        self._pending = b""  # partial trailing line between reads
+        self.seq = 0
+        self.lines: deque[dict] = deque(maxlen=LOG_TAIL_LINES)
+        self.progress: dict = {
+            "plan": [],
+            "phase": None,
+            "phase_index": 0,
+            "phase_of": 0,
+            "current": None,
+            "i": 0,
+            "n": 0,
+            "ok": 0,
+            "failed": 0,
+            "items": 0,
+            # Totals for phases that already finished. The per-phase counters
+            # above reset at every phase boundary (they have to, they drive
+            # the phase progress bar), so without these a job whose last
+            # phase had nothing to do would end up reporting zero work done.
+            "cum_ok": 0,
+            "cum_failed": 0,
+            "cum_items": 0,
+            "retries": 0,
+            "last_retry": None,
+            "last_error": None,
+            "phase_started_at": None,
+            "rate": None,
+            "eta_seconds": None,
+            "summary": None,
+        }
+
+    # -- process state ----------------------------------------------------
+    def is_running(self) -> bool:
+        if self.proc is not None:
+            return self.proc.poll() is None
+        if self.pid <= 0:
+            return False
+        try:
+            os.kill(self.pid, 0)  # signal 0 = existence check only
+        except (ProcessLookupError, PermissionError):
+            return False
+        except OSError:
+            return False
+        return True
+
+    def poll_exit(self) -> int | None:
+        if self.proc is not None:
+            return self.proc.poll()
+        return None if self.is_running() else -1
+
+    def stop(self) -> bool:
+        if not self.is_running():
+            return False
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            return True
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except OSError:
+            return False
+        return True
+
+    # -- output consumption ----------------------------------------------
+    def _add_line(self, text: str) -> None:
+        self.seq += 1
+        self.lines.append({"seq": self.seq, "text": text})
+
+    def drain(self) -> None:
+        """Consume whatever the child has written since the last call.
+
+        Incremental by byte offset. The old admin page re-read the *entire*
+        log file every 5s per open pane and then threw away all but the last
+        100 lines; on a long crawl that's megabytes of pointless I/O per poll.
+        """
+        try:
+            size = self.log_path.stat().st_size
+        except FileNotFoundError:
+            return
+        if size < self.offset:  # log was truncated/rotated under us
+            self.offset = 0
+            self._pending = b""
+        if size == self.offset:
+            return
+        with open(self.log_path, "rb") as fh:
+            fh.seek(self.offset)
+            chunk = fh.read()
+        self.offset += len(chunk)
+        buffer = self._pending + chunk
+        *complete, self._pending = buffer.split(b"\n")
+        for raw in complete:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r")
+            if not line.strip():
+                continue
+            if line.startswith("{"):
+                try:
+                    self._apply_event(json.loads(line))
+                    continue
+                except ValueError:
+                    pass  # not an event after all; show it verbatim
+            self._add_line(line)
+
+    def _apply_event(self, event: dict) -> None:
+        """Fold one NDJSON progress event into this job's live state."""
+        kind = event.get("ev")
+        p = self.progress
+        if kind == "plan":
+            p["plan"] = event.get("steps") or []
+            self._add_line("plan: " + " → ".join(p["plan"]))
+        elif kind == "phase":
+            p["cum_ok"] += p["ok"]
+            p["cum_failed"] += p["failed"]
+            p["cum_items"] += p["items"]
+            p["phase"] = event.get("name")
+            p["phase_index"] = event.get("index") or 0
+            p["phase_of"] = event.get("of") or 0
+            p["n"] = event.get("total") or 0
+            p["i"] = p["ok"] = p["failed"] = p["items"] = 0
+            p["current"] = None
+            p["phase_started_at"] = time.time()
+            p["rate"] = p["eta_seconds"] = None
+            self._add_line(f"== {p['phase']}")
+        elif kind == "phase_total":
+            p["n"] = event.get("total") or 0
+        elif kind == "current":
+            p["current"] = event.get("label")
+            p["i"] = event.get("i") or p["i"]
+            if event.get("n"):
+                p["n"] = event["n"]
+        elif kind == "tick":
+            p["i"] = event.get("i") or p["i"]
+            if event.get("n"):
+                p["n"] = event["n"]
+            p["ok"] = event.get("okc", p["ok"])
+            p["failed"] = event.get("failc", p["failed"])
+            p["items"] = event.get("itemc", p["items"])
+            label = event.get("label")
+            if event.get("ok"):
+                self._add_line(f"  ✓ {label} — {event.get('items') if event.get('items') is not None else 0} items")
+            else:
+                p["last_error"] = f"{label}: {event.get('error') or 'failed'}"
+                mark = "permanent" if event.get("permanent") else "will retry later"
+                self._add_line(f"  ✗ {label} — {str(event.get('error') or '')[:160]} ({mark})")
+            self._recompute_eta()
+        elif kind == "retry":
+            p["retries"] += 1
+            p["last_retry"] = {
+                "reason": event.get("reason"),
+                "wait": event.get("wait"),
+                "pacing": event.get("pacing"),
+                "attempt": event.get("attempt"),
+                "of": event.get("of"),
+                "at": event.get("t"),
+            }
+            self._add_line(
+                f"  ⏳ {event.get('reason')} — backing off {event.get('wait')}s"
+                f" (attempt {event.get('attempt')}/{event.get('of')}, pacing {event.get('pacing')}s)"
+            )
+        elif kind == "done":
+            p["summary"] = event.get("summary")
+            p["current"] = None
+            self._add_line(f"done in {event.get('elapsed', 0):.0f}s")
+        elif kind == "log":
+            self._add_line(str(event.get("msg", "")))
+
+    def _recompute_eta(self) -> None:
+        p = self.progress
+        started = p.get("phase_started_at")
+        if not started or not p.get("i"):
+            return
+        elapsed = time.time() - started
+        if elapsed <= 0:
+            return
+        rate = p["i"] / elapsed  # venues per second
+        p["rate"] = round(rate, 3)
+        remaining = max(0, (p.get("n") or 0) - p["i"])
+        p["eta_seconds"] = round(remaining / rate) if rate > 0 and remaining else 0
+
+    # -- serialization -----------------------------------------------------
+    def to_json(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "title": self.title,
+            "params": self.params,
+            "state": self.state,
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+            "returncode": self.returncode,
+            "seq": self.seq,
+            "progress": self.progress,
+        }
 
 
 class JobManager:
+    """Tracks crawl jobs by id, persists them, and re-attaches after restart.
+
+    The previous version keyed jobs by *job name* in a plain dict, which made
+    the eleven fixed jobs a hard limit (one run per name, no history) and lost
+    all state when the webapp restarted — the README had to document that
+    restarting orphans a running crawl.
+    """
+
     def __init__(self) -> None:
-        self.jobs: dict[str, dict] = {}
+        self.jobs: dict[str, _Job] = {}
+        self._lock = threading.Lock()
+        self._pump_thread: threading.Thread | None = None
+        self._stop_pump = threading.Event()
 
-    def is_running(self, name: str) -> bool:
-        job = self.jobs.get(name)
-        return bool(job and job["proc"].poll() is None)
+    # -- lifecycle --------------------------------------------------------
+    def start_background_pump(self) -> None:
+        """Continuously fold child output into progress state.
 
-    def start(self, name: str, limit: int, delay: float, max_age_hours: float) -> Path:
-        if name not in JOB_SPECS:
-            raise ValueError(f"unknown job: {name}")
-        if self.is_running(name):
-            raise RuntimeError(f"job '{name}' is already running")
+        Progress must advance whether or not a browser is polling, so that
+        (a) reopening the page shows current state immediately, and (b) a
+        finished job is recorded even if nobody was watching.
+        """
+        if self._pump_thread and self._pump_thread.is_alive():
+            return
+        self._pump_thread = threading.Thread(target=self._pump_loop, name="job-pump", daemon=True)
+        self._pump_thread.start()
 
+    def _pump_loop(self) -> None:
+        while not self._stop_pump.wait(0.5):
+            try:
+                self.pump()
+            except Exception:  # noqa: BLE001 - a pump error must not kill the thread
+                LOG.exception("job pump iteration failed")
+
+    def pump(self) -> None:
+        with self._lock:
+            jobs = list(self.jobs.values())
+        for job in jobs:
+            if job.state != "running":
+                continue
+            job.drain()
+            if not job.is_running():
+                job.drain()  # final flush after exit
+                code = job.poll_exit()
+                job.returncode = code
+                job.finished_at = time.time()
+                if job.progress.get("summary") is not None:
+                    job.state = "done"
+                elif code == 0:
+                    job.state = "done"
+                elif code in (-signal.SIGTERM, -signal.SIGKILL, -15, -9):
+                    job.state = "stopped"
+                else:
+                    job.state = "failed"
+                self._persist(job)
+
+    def reattach(self) -> None:
+        """Pick running jobs back up after a webapp restart.
+
+        A crawl is a child process writing to a log file, so as long as the
+        pid is alive its whole progress history can be rebuilt by replaying
+        the log from byte 0.
+        """
+        cache = Cache(DB_PATH)
+        try:
+            for row in cache.list_jobs(limit=MAX_CONCURRENT_JOBS * 4):
+                if row["state"] != "running":
+                    continue
+                job = _Job(
+                    row["id"],
+                    row["kind"],
+                    row["title"],
+                    json.loads(row["params"] or "{}"),
+                    Path(row["log_path"]),
+                    row["pid"] or 0,
+                )
+                job.created_at = row["created_at"] or time.time()
+                if job.is_running():
+                    job.drain()  # replay the log to rebuild progress
+                    with self._lock:
+                        self.jobs[job.id] = job
+                    LOG.info("re-attached to running job %s (pid %s)", job.id, job.pid)
+                else:
+                    # Died while we were down: keep whatever the log recorded
+                    # rather than leaving a permanently "running" row.
+                    job.drain()
+                    job.state = "done" if job.progress.get("summary") else "orphaned"
+                    job.finished_at = time.time()
+                    with self._lock:
+                        self.jobs[job.id] = job
+                    self._persist(job)
+        finally:
+            cache.close()
+
+    # -- starting ---------------------------------------------------------
+    def running_count(self) -> int:
+        with self._lock:
+            return sum(1 for j in self.jobs.values() if j.state == "running")
+
+    def start(self, kind: str, title: str, argv: list[str], params: dict) -> _Job:
+        if self.running_count() >= MAX_CONCURRENT_JOBS:
+            raise RuntimeError(f"already running {MAX_CONCURRENT_JOBS} jobs — stop one first")
+
+        job_id = uuid.uuid4().hex[:12]
         JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = JOB_LOG_DIR / f"{name}.log"
-        args = [a.format(limit=limit, max_age_hours=max_age_hours) for a in JOB_SPECS[name]["args"]]
-        cmd = [sys.executable, "-m", "wolt_il_search.cli", "--delay", str(delay)]
+        # Job-id-scoped log files: the old code wrote {name}.log and truncated
+        # it on every start, destroying the previous run's output.
+        log_path = JOB_LOG_DIR / f"{job_id}.log"
+
+        cmd = [sys.executable, "-m", "wolt_il_search.cli"]
         if DB_PATH:
             cmd += ["--db", DB_PATH]
-        cmd += args
+        cmd += argv
 
         # Popen dup()s the fd into the child on launch, so the parent's handle
-        # can close immediately — holding it open in self.jobs would leak one
-        # fd per job start for the life of the webapp process.
+        # can close immediately — holding it open would leak one fd per job
+        # start for the life of the webapp process.
         with open(log_path, "w") as log_file:
             proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-        self.jobs[name] = {"proc": proc, "log_path": log_path, "started_at": time.time()}
-        return log_path
 
-    def stop(self, name: str) -> bool:
-        job = self.jobs.get(name)
-        if job and self.is_running(name):
-            proc = job["proc"]
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-            return True
-        return False
+        job = _Job(job_id, kind, title, params, log_path, proc.pid, proc=proc)
+        with self._lock:
+            self.jobs[job_id] = job
+        self._persist(job, insert=True)
+        self.start_background_pump()
+        return job
 
-    def status(self, name: str) -> dict:
-        job = self.jobs.get(name)
+    def stop(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
         if not job:
-            return {"running": False, "started_at": None, "returncode": None}
-        running = self.is_running(name)
-        return {
-            "running": running,
-            "started_at": job["started_at"],
-            "returncode": None if running else job["proc"].returncode,
-        }
+            raise KeyError(job_id)
+        stopped = job.stop()
+        if stopped:
+            job.state = "stopped"
+            job.finished_at = time.time()
+            self._persist(job)
+        return stopped
 
-    def tail_log(self, name: str, lines: int = 200) -> str:
-        job = self.jobs.get(name)
-        if not job or not job["log_path"].exists():
-            return ""
-        text = job["log_path"].read_text(errors="replace")
-        return "\n".join(text.splitlines()[-lines:])
+    # -- persistence ------------------------------------------------------
+    def _persist(self, job: _Job, insert: bool = False) -> None:
+        cache = Cache(DB_PATH)
+        try:
+            payload = {
+                "id": job.id,
+                "kind": job.kind,
+                "title": job.title,
+                "params": json.dumps(job.params, ensure_ascii=False),
+                "state": job.state,
+                "pid": job.pid,
+                "log_path": str(job.log_path),
+                "progress": json.dumps(job.progress, ensure_ascii=False),
+                "created_at": job.created_at,
+            }
+            if insert:
+                cache.insert_job(payload)
+                cache.prune_jobs()
+            else:
+                cache.update_job(
+                    job.id,
+                    state=job.state,
+                    progress=payload["progress"],
+                    finished_at=job.finished_at,
+                    returncode=job.returncode,
+                )
+        finally:
+            cache.close()
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            jobs = sorted(
+                self.jobs.values(),
+                key=lambda j: (j.state != "running", -(j.created_at or 0)),
+            )
+        return [j.to_json() for j in jobs]
+
+    def log_since(self, job_id: str, after_seq: int) -> dict:
+        job = self.jobs.get(job_id)
+        if not job:
+            raise KeyError(job_id)
+        job.drain()
+        lines = [line for line in job.lines if line["seq"] > after_seq]
+        # A client that fell far behind (pane closed for a while) may have
+        # missed lines evicted from the ring buffer; tell it so it can note
+        # the gap instead of silently showing a discontinuous log.
+        oldest = job.lines[0]["seq"] if job.lines else 0
+        return {
+            "lines": lines,
+            "seq": job.seq,
+            "gap": after_seq > 0 and oldest > after_seq + 1,
+            "state": job.state,
+        }
 
 
 job_manager = JobManager()
-app = FastAPI(title="wolt-il-search")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Re-attach to crawls that outlived a previous webapp process (Docker
+    # restart aside, a plain `uvicorn` restart used to orphan them silently)
+    # and start folding their output into progress state immediately, so the
+    # admin page is accurate the moment it's opened rather than only after
+    # the first poll.
+    try:
+        job_manager.reattach()
+    except Exception:  # noqa: BLE001 - never block startup on job recovery
+        LOG.exception("job re-attach failed")
+    job_manager.start_background_pump()
+    yield
+
+
+app = FastAPI(title="wolt-il-search", lifespan=_lifespan)
 
 
 def _cache() -> Cache:
@@ -285,100 +647,164 @@ def api_product_lines() -> JSONResponse:
 
 @app.get("/api/status")
 def api_status() -> JSONResponse:
+    """Cache counts + per-category progress.
+
+    `by_product_line` now carries the denominators the admin UI needs to draw
+    progress (pending / retrying / gave_up) and counts venues that actually
+    have items separately from ones merely *marked* fetched — those differ
+    whenever a fetch succeeded but returned an empty catalog.
+    """
     cache = _cache()
     try:
         counts = cache.counts()
-        by_pl = cache.conn.execute(
-            """
-            SELECT product_line,
-                   COUNT(*) total,
-                   SUM(CASE WHEN menu_fetched_at IS NOT NULL THEN 1 ELSE 0 END) fetched
-            FROM venues GROUP BY product_line ORDER BY total DESC
-            """
-        ).fetchall()
-        counts["by_product_line"] = [dict(r) for r in by_pl]
-        counts["jobs"] = {name: job_manager.status(name) for name in JOB_SPECS}
+        counts["by_product_line"] = cache.product_line_stats()
+        counts["jobs"] = job_manager.snapshot()
         return JSONResponse(counts)
     finally:
         cache.close()
 
 
-@app.post("/api/jobs/{name}/start")
-def api_job_start(name: str, limit: int = 200, delay: float = 1.5, max_age_hours: float = 168.0) -> JSONResponse:
-    # Clamp rather than trust the caller: an admin API with no auth (see
-    # README) shouldn't let anyone on the same network disable rate limiting
-    # (delay=0), kick off an effectively-unbounded crawl, or set an age
-    # cutoff so large it never re-touches an already-fetched venue.
-    limit = max(1, min(limit, 5000))
-    delay = max(0.5, min(delay, 30.0))
-    max_age_hours = max(0.0, min(max_age_hours, 24 * 365))
-    try:
-        job_manager.start(name, limit=limit, delay=delay, max_age_hours=max_age_hours)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from e
-    except RuntimeError as e:
-        raise HTTPException(409, str(e)) from e
+def _catalog(cache: Cache, refresh: bool = False) -> list:
+    """Crawlable categories: live Wolt discovery merged with cache stats.
 
-    # Remember these as this job's defaults for next time, so restarting
-    # after a stop doesn't mean re-typing the same limit/max-age/delay.
+    Discovery is cached in `meta` for a day, so this is a local read unless
+    the operator explicitly refreshes it.
+    """
+    client = WoltClient(delay_seconds=1.0)
+    return build_catalog(cache, discover(client, cache, force=refresh))
+
+
+@app.get("/api/categories")
+def api_categories(refresh: bool = False) -> JSONResponse:
     cache = _cache()
     try:
-        cache.set_meta(
-            f"job_params:{name}",
-            json.dumps({"limit": limit, "max_age_hours": max_age_hours, "delay": delay}),
+        catalog = _catalog(cache, refresh=refresh)
+        return JSONResponse({"categories": [c.to_json() for c in catalog]})
+    finally:
+        cache.close()
+
+
+@app.get("/api/admin/state")
+def api_admin_state() -> JSONResponse:
+    """Everything the admin page renders, in one request.
+
+    One poll for counts + categories + all job progress keeps the page's
+    refresh cycle to a single round-trip, instead of the old page's
+    status-poll plus one log fetch per open pane.
+    """
+    cache = _cache()
+    try:
+        catalog = _catalog(cache)
+        counts = cache.counts()
+        counts["by_product_line"] = cache.product_line_stats()
+        return JSONResponse(
+            {
+                "counts": counts,
+                "categories": [c.to_json() for c in catalog],
+                "jobs": job_manager.snapshot(),
+                "limits": {"max_concurrent": MAX_CONCURRENT_JOBS, "running": job_manager.running_count()},
+            }
         )
     finally:
         cache.close()
-    return JSONResponse({"started": True})
 
 
-@app.post("/api/jobs/{name}/stop")
-def api_job_stop(name: str) -> JSONResponse:
-    if name not in JOB_SPECS:
-        raise HTTPException(404, f"unknown job: {name}")
-    stopped = job_manager.stop(name)
-    return JSONResponse({"stopped": stopped})
+@app.post("/api/jobs")
+async def api_job_create(request: Request) -> JSONResponse:
+    """Create one crawl job for a set of categories.
+
+    Replaces the per-job `POST /api/jobs/{name}/start` endpoints: a job is now
+    described by *what to crawl*, and defaults to crawling all of it.
+    """
+    body = await request.json() if await request.body() else {}
+    cache = _cache()
+    try:
+        catalog = _catalog(cache)
+        valid = {c.key for c in catalog}
+        labels = {c.key: c.label for c in catalog}
+        params = CrawlParams.from_request(body, valid)
+        title = ", ".join(labels.get(k, k) for k in params.categories)
+        if len(title) > 90:
+            title = f"{len(params.categories)} categories"
+        try:
+            job = job_manager.start("crawl", title, params.to_argv(), dataclasses.asdict(params))
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+        # Remember the advanced settings so the form comes back the way the
+        # operator left it, without re-typing.
+        cache.set_meta(
+            "crawl_defaults",
+            json.dumps(
+                {
+                    "limit": params.limit,
+                    "max_age_hours": params.max_age_hours,
+                    "delay": params.delay,
+                    "max_delay": params.max_delay,
+                    "max_attempts": params.max_attempts,
+                    "phases": list(params.phases),
+                }
+            ),
+        )
+        return JSONResponse({"id": job.id, "job": job.to_json()})
+    finally:
+        cache.close()
 
 
-@app.get("/api/jobs/{name}/log")
-def api_job_log(name: str, lines: int = 200) -> JSONResponse:
-    if name not in JOB_SPECS:
-        raise HTTPException(404, f"unknown job: {name}")
-    return JSONResponse({"log": job_manager.tail_log(name, lines), "status": job_manager.status(name)})
+@app.post("/api/jobs/reindex")
+def api_job_reindex() -> JSONResponse:
+    """Rebuild the FTS index without crawling (every crawl already does this)."""
+    try:
+        job = job_manager.start("reindex", "Rebuild search index", ["reindex"], {})
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return JSONResponse({"id": job.id})
 
 
 @app.get("/api/jobs")
 def api_jobs() -> JSONResponse:
-    return JSONResponse({name: job_manager.status(name) for name in JOB_SPECS})
+    return JSONResponse({"jobs": job_manager.snapshot()})
 
 
-@app.get("/api/jobs/meta")
-def api_jobs_meta() -> JSONResponse:
-    """Per-job config (section, description, which controls apply, defaults)
-    — the admin page builds its whole layout from this rather than
-    hardcoding it a second time in JS. Defaults are whatever this job was
-    last started with, if it's ever been started, falling back to the
-    hardcoded JOB_SPECS default otherwise.
-    """
+@app.get("/api/jobs/defaults")
+def api_job_defaults() -> JSONResponse:
     cache = _cache()
     try:
-        result = {}
-        for name, spec in JOB_SPECS.items():
-            saved_raw = cache.get_meta(f"job_params:{name}")
-            saved = json.loads(saved_raw) if saved_raw else {}
-            result[name] = {
-                "section": spec["section"],
-                "description": spec["description"],
-                "has_limit": spec.get("has_limit", False),
-                "has_max_age": spec.get("has_max_age", False),
-                "default_limit": saved.get("limit", spec.get("default_limit", 200)),
-                "default_max_age_hours": saved.get("max_age_hours", spec.get("default_max_age_hours", 168.0)),
-                "default_delay": saved.get("delay", 1.5),
-                "heavy": spec.get("heavy", False),
+        raw = cache.get_meta("crawl_defaults")
+        saved = json.loads(raw) if raw else {}
+        return JSONResponse(
+            {
+                "limit": saved.get("limit", 0),
+                "max_age_hours": saved.get("max_age_hours", 168.0),
+                "delay": saved.get("delay", 1.2),
+                "max_delay": saved.get("max_delay", 60.0),
+                "max_attempts": saved.get("max_attempts", 4),
+                "phases": saved.get("phases", ["discover", "items"]),
             }
-        return JSONResponse(result)
+        )
     finally:
         cache.close()
+
+
+@app.post("/api/jobs/{job_id}/stop")
+def api_job_stop(job_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"stopped": job_manager.stop(job_id)})
+    except KeyError as e:
+        raise HTTPException(404, f"unknown job: {job_id}") from e
+
+
+@app.get("/api/jobs/{job_id}/log")
+def api_job_log(job_id: str, after: int = 0) -> JSONResponse:
+    """Incremental log tail: only lines newer than `after`.
+
+    The old endpoint re-read the whole log file and returned the last N lines
+    as one blob, which the page then wrote into a freshly-created <pre> —
+    hence the flash and lost scroll position every 5 seconds.
+    """
+    try:
+        return JSONResponse(job_manager.log_since(job_id, after))
+    except KeyError as e:
+        raise HTTPException(404, f"unknown job: {job_id}") from e
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -425,6 +851,26 @@ _BASE_CSS = r"""
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.45; }
+/* Form controls don't inherit the font stack on their own, so without this a
+   <select> renders in the OS UI font while every label beside it doesn't. */
+input, select, button, textarea { font-family: inherit; }
+/* One checkbox appearance for the whole app. The shop facets need a custom
+   box because they're tri-state (include / exclude / off), and a native
+   checkbox can't express that — so rather than leave a 13px OS checkbox next
+   to a 16px custom one in adjacent panels doing the same job, the native ones
+   are restyled to match .facet-icon exactly. */
+input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  width: 1rem; height: 1rem; flex-shrink: 0; margin: 0;
+  border: 1.5px solid var(--border); border-radius: 4px; background: none;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+}
+input[type="checkbox"]:checked { background: var(--accent-soft); border-color: var(--accent); }
+input[type="checkbox"]:checked::after {
+  content: '\2713'; font-size: 0.7rem; font-weight: 700; line-height: 1; color: var(--accent);
+}
+input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input[type="radio"] { accent-color: var(--accent); flex-shrink: 0; margin: 0; }
 a { color: var(--accent); }
 [dir="auto"] { unicode-bidi: plaintext; }
 
@@ -467,34 +913,66 @@ details:not([open]) > .panel-header { border-bottom: none; }
 .field:last-child { margin-bottom: 0; }
 .field label { display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.35rem; }
 .field input[type="text"], .field input[type="number"], .field select {
+  /* --bg, not --surface: panels are --surface, so a same-colour input reads as
+     a flat outline. Recessing it matches the admin form's inputs too. */
   width: 100%; padding: 0.5rem 0.6rem; border: 1px solid var(--border); border-radius: var(--radius-sm);
-  font-size: 0.9rem; color: var(--text); background: var(--surface);
+  font-size: 0.9rem; color: var(--text); background: var(--bg);
 }
 .field input:focus, .field select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
 .range-row { display: flex; gap: 0.5rem; }
-.checklist { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.3rem; }
-.checklist label { display: flex; align-items: center; gap: 0.45rem; font-size: 0.85rem; font-weight: 400; color: var(--text); cursor: pointer; }
-.checklist .count { color: var(--text-muted); font-size: 0.78rem; }
+
+/* One primitive for every "toggle a filter" row, whatever widget it wraps:
+   the region/category checklists, the shop include/exclude buttons, the
+   standalone checkboxes in More filters, and the admin form's checkboxes.
+   Each of those used to carry its own padding, gap, hover and focus
+   treatment, so a single sidebar column read as four different control
+   languages stacked on top of each other. */
+.check-row, .field label.check-row, .checklist label, .facet-row {
+  /* No width:100% — flex/grid parents already stretch these rows, and forcing
+     it made a .check-row used inline in a toolbar claim the whole line. */
+  display: flex; align-items: center; gap: 0.5rem; margin: 0;
+  padding: 0.28rem 0.4rem; border-radius: var(--radius-sm);
+  font-size: 0.85rem; font-weight: 400; line-height: 1.35; color: var(--text);
+  text-transform: none; letter-spacing: 0;
+  cursor: pointer; text-align: left; background: none; border: none;
+}
+.check-row:hover, .checklist label:hover, .facet-row:hover { background: var(--bg); }
+.facet-row:hover .facet-label { color: var(--accent); }
+/* focus-within so a keyboard user tabbing onto the nested checkbox sees the
+   whole row highlighted, matching how the facet buttons behave. */
+.check-row:focus-within, .checklist label:focus-within, .facet-row:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -1px;
+}
+.checklist {
+  max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.05rem;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  /* Reserve the gutter always, so counts never sit under the scrollbar thumb
+     and a list doesn't reflow when it grows past the scroll threshold. */
+  padding-right: 0.4rem; scrollbar-gutter: stable;
+}
+/* Counts right-align into a column rather than trailing the label text, so
+   "which of these has the most venues" is a vertical scan. */
+.checklist .count, .facet-count {
+  margin-left: auto; padding-left: 0.6rem; color: var(--text-muted);
+  font-size: 0.78rem; font-variant-numeric: tabular-nums;
+}
+/* Sits flush with the rows it clears (which now carry 0.4rem of side padding)
+   instead of hanging off the panel's left edge. */
 .chk-toggle {
-  font-size: 0.75rem; color: var(--accent); cursor: pointer; text-decoration: underline; margin-bottom: 0.4rem;
-  display: inline-block; background: none; border: none; padding: 0; font-family: inherit;
+  font-size: 0.75rem; color: var(--accent); cursor: pointer; text-decoration: underline; margin: 0 0 0.5rem 0.4rem;
+  display: inline-block; background: none; border: none; padding: 0;
 }
 .chk-toggle:focus-visible { outline: 2px solid var(--accent); border-radius: 2px; }
 .facet-hint { font-weight: 400; text-transform: none; letter-spacing: 0; font-size: 0.72rem; color: var(--text-muted); display: block; margin-top: 0.15rem; }
-.facet-row {
-  display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0; cursor: pointer; font-size: 0.85rem;
-  background: none; border: none; width: 100%; text-align: left; font-family: inherit; color: var(--text);
-}
-.facet-row:hover .facet-label { color: var(--accent); }
-.facet-row:focus-visible { outline: 2px solid var(--accent); border-radius: 4px; }
 .facet-icon {
   width: 1rem; height: 1rem; border: 1.5px solid var(--border); border-radius: 4px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700; color: transparent;
 }
 .facet-icon.include { background: var(--green-soft); border-color: var(--green); color: var(--green); }
 .facet-icon.exclude { background: var(--red-soft); border-color: var(--red); color: var(--red); }
-.facet-label { flex: 1; }
-.facet-count { color: var(--text-muted); font-size: 0.78rem; }
+/* Truncate rather than wrap: a wrapped label made rows different heights and
+   pushed its count out of the column. */
+.facet-label, .chk-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .searchbar { display: flex; gap: 0.6rem; margin-bottom: 1rem; }
 .search-input-wrap { position: relative; flex: 1; }
@@ -549,6 +1027,37 @@ button.primary:hover { background: var(--accent-fill-hover); }
 """
 
 
+#: Helpers both pages need. Kept in one string for the same reason as
+#: _BASE_CSS: the two pages are separate documents with no bundler, so
+#: anything not shared here silently drifts apart between them.
+_BASE_JS = r"""
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+const PL_LABELS = {
+  restaurant: 'Restaurants', electronics: 'Electronics', general_merchandise: 'General Merchandise',
+  home_and_diy: 'Home & DIY', florist: 'Florist', pet_supply: 'Pet Supply',
+  toys_games_and_kids: 'Toys & Kids', pharmacy: 'Pharmacy', health_and_beauty: 'Health & Beauty',
+  grocery: 'Grocery',
+};
+function humanizeLabel(v) { return PL_LABELS[v] || v; }
+
+const fmtInt = (n) => (n ?? 0).toLocaleString();
+
+function debounce(fn, ms) {
+  let handle;
+  return (...args) => { clearTimeout(handle); handle = setTimeout(() => fn(...args), ms); };
+}
+
+// Only write when the value actually changed, so repeated renders don't cause
+// needless layout/paint churn or clobber a text selection inside the node.
+function setText(node, value) {
+  const text = value == null ? '' : String(value);
+  if (node.textContent !== text) node.textContent = text;
+}
+"""
+
 SEARCH_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -592,7 +1101,7 @@ SEARCH_HTML = r"""<!doctype html>
         <summary class="panel-header">More filters</summary>
         <div class="panel-body">
           <div class="field">
-            <label><input type="checkbox" id="onlyOpen"> Open now</label>
+            <label class="check-row" for="onlyOpen"><input type="checkbox" id="onlyOpen"> Open now</label>
           </div>
           <div class="field">
             <label for="minRating">Min rating</label>
@@ -651,7 +1160,7 @@ SEARCH_HTML = r"""<!doctype html>
   </div>
 </div>
 
-<script>
+<script>""" + _BASE_JS + r"""
 const PAGE_SIZE = 20;
 let currentOffset = 0;
 let currentTotal = 0;
@@ -659,35 +1168,31 @@ let currentTotal = 0;
 let shopFacetState = new Map();
 // selected item-category facet values
 let selectedCategories = new Set();
-
-function esc(s) {
-  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-const PL_LABELS = {
-  restaurant: 'Restaurants', electronics: 'Electronics', general_merchandise: 'General Merchandise',
-  home_and_diy: 'Home & DIY', florist: 'Florist', pet_supply: 'Pet Supply',
-  toys_games_and_kids: 'Toys & Kids', pharmacy: 'Pharmacy', health_and_beauty: 'Health & Beauty',
-  grocery: 'Grocery',
-};
-function humanizeLabel(v) { return PL_LABELS[v] || v; }
+// Monotonic id of the newest search. Every render checks it before touching
+// the DOM (see runSearch) so a slow early response can't overwrite a newer one.
+let searchSeq = 0;
+let inFlight = null;
 
 function checklistHtml(id, items, valueKey, labelKey, countKey, humanize) {
   const el = document.getElementById(id);
   el.innerHTML = items.map(it => `
     <label><input type="checkbox" value="${esc(it[valueKey])}" data-group="${id}">
-      ${esc(humanize ? humanizeLabel(it[labelKey]) : it[labelKey])} ${countKey ? `<span class="count">(${it[countKey]})</span>` : ''}
+      <span class="chk-label" dir="auto">${esc(humanize ? humanizeLabel(it[labelKey]) : it[labelKey])}</span>
+      ${countKey ? `<span class="count">${fmtInt(it[countKey])}</span>` : ''}
     </label>`).join('');
 }
 
 async function loadFilters() {
-  const regions = await (await fetch('/api/regions')).json();
+  // Fetched in parallel: three independent reads, no reason to serialize them.
+  const [regions, plines, status] = await Promise.all([
+    fetch('/api/regions').then(r => r.json()),
+    fetch('/api/product-lines').then(r => r.json()),
+    fetch('/api/status').then(r => r.json()),
+  ]);
   checklistHtml('regionList', regions, 'slug', 'name', null, false);
-  const plines = await (await fetch('/api/product-lines')).json();
   checklistHtml('plList', plines, 'product_line', 'product_line', 'count', true);
-  const status = await (await fetch('/api/status')).json();
-  document.getElementById('headerStats').textContent =
-    `${status.venues.toLocaleString()} venues · ${status.menu_items.toLocaleString()} items indexed`;
+  setText(document.getElementById('headerStats'),
+    `${fmtInt(status.venues)} venues · ${fmtInt(status.menu_items)} items indexed`);
 }
 
 document.querySelectorAll('.chk-toggle').forEach(t => {
@@ -760,6 +1265,11 @@ function renderShopFacets(facets) {
   const list = document.getElementById('shopFacetList');
   if (!facets.length) { panel.style.display = 'none'; return; }
   panel.style.display = 'block';
+  // Clicking a facet triggers a search, which re-renders this list — i.e. the
+  // very button the user just activated gets destroyed under them, losing
+  // keyboard focus and the scroll position. Remember both and put them back.
+  const focusedSlug = document.activeElement?.closest?.('.facet-row')?.dataset.slug;
+  const scrollTop = list.scrollTop;
   list.innerHTML = facets.map(f => {
     const state = shopFacetState.get(f.value);
     const cls = state === 'include' ? 'include' : state === 'exclude' ? 'exclude' : '';
@@ -771,6 +1281,8 @@ function renderShopFacets(facets) {
       <span class="facet-count">${f.count}</span>
     </button>`;
   }).join('');
+  list.scrollTop = scrollTop;
+  if (focusedSlug) list.querySelector(`.facet-row[data-slug="${CSS.escape(focusedSlug)}"]`)?.focus();
 }
 
 function renderCategoryFacets(facets) {
@@ -778,12 +1290,19 @@ function renderCategoryFacets(facets) {
   const list = document.getElementById('categoryFacetList');
   if (!facets.length) { panel.style.display = 'none'; return; }
   panel.style.display = 'block';
+  const focusedValue = document.activeElement?.matches?.('input[data-category-facet]')
+    ? document.activeElement.value : null;
+  const scrollTop = list.scrollTop;
   list.innerHTML = facets.map(f => {
     const checked = selectedCategories.has(f.value) ? 'checked' : '';
     return `<label><input type="checkbox" value="${esc(f.value)}" ${checked} data-category-facet="1">
-      <span dir="auto">${esc(f.label)}</span> <span class="count">(${f.count})</span>
+      <span class="chk-label" dir="auto">${esc(f.label)}</span> <span class="count">${fmtInt(f.count)}</span>
     </label>`;
   }).join('');
+  list.scrollTop = scrollTop;
+  if (focusedValue) {
+    list.querySelector(`input[data-category-facet][value="${CSS.escape(focusedValue)}"]`)?.focus();
+  }
 }
 
 document.getElementById('shopFacetList').addEventListener('click', (e) => {
@@ -831,6 +1350,74 @@ function buildParams(offset) {
   return params;
 }
 
+// Every filter change calls doSearch(), and facet clicks aren't debounced, so
+// several searches can legitimately be in flight at once. Without a guard the
+// one that renders last wins — which is whichever the *server* happened to
+// finish last, not the one the user asked for most recently.
+async function runSearch(offset) {
+  const seq = ++searchSeq;
+  if (inFlight) inFlight.abort();  // don't make the server finish work nobody wants
+  const controller = new AbortController();
+  inFlight = controller;
+  try {
+    const resp = await fetch('/api/search?' + buildParams(offset), { signal: controller.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    return seq === searchSeq ? data : null;  // stale: a newer search already started
+  } finally {
+    if (inFlight === controller) inFlight = null;
+  }
+}
+
+function searchErrorHtml(err) {
+  return `<div class="empty-state">Search failed: ${esc(err.message || err)}.
+    <button type="button" id="retrySearch" class="more-items" style="margin-top:.6rem">Try again</button></div>`;
+}
+
+// --- shareable URLs -------------------------------------------------------
+// buildParams() already produces the exact querystring the API takes, so the
+// address bar can just mirror it (minus pagination). Without this a search
+// can't be bookmarked or shared, and a reload silently drops the query,
+// facets, price range and sort.
+const URL_SKIP = new Set(['offset', 'limit', 'items_per_venue']);
+
+function syncUrl(newSearch) {
+  const params = buildParams(0);
+  URL_SKIP.forEach((k) => params.delete(k));
+  if (!params.get('q')) params.delete('q');
+  const qs = params.toString();
+  const url = qs ? `${location.pathname}?${qs}` : location.pathname;
+  if (url === location.pathname + location.search) return;
+  // Submitting a new query gets a history entry, so Back returns to the
+  // previous search. Tweaking a filter or a facet only rewrites the current
+  // entry — those fire on debounced input, and one entry per keystroke would
+  // make Back useless for anything else.
+  if (newSearch) history.pushState(null, '', url);
+  else history.replaceState(null, '', url);
+}
+
+function restoreFromUrl() {
+  const p = new URLSearchParams(location.search);
+  if (![...p.keys()].length) return false;
+  const setValue = (id, key) => { const v = p.get(key); if (v != null) document.getElementById(id).value = v; };
+  setValue('q', 'q');
+  setValue('minRating', 'min_rating');
+  setValue('minPrice', 'min_price');
+  setValue('maxPrice', 'max_price');
+  setValue('sort', 'sort');
+  document.getElementById('onlyOpen').checked = p.get('open') === 'true';
+  const check = (group, key) => {
+    const wanted = new Set((p.get(key) || '').split(',').filter(Boolean));
+    document.querySelectorAll(`input[data-group="${group}"]`).forEach((cb) => { cb.checked = wanted.has(cb.value); });
+  };
+  check('regionList', 'regions');
+  check('plList', 'product_lines');
+  (p.get('include_venues') || '').split(',').filter(Boolean).forEach((s) => shopFacetState.set(s, 'include'));
+  (p.get('exclude_venues') || '').split(',').filter(Boolean).forEach((s) => shopFacetState.set(s, 'exclude'));
+  (p.get('categories') || '').split(',').filter(Boolean).forEach((c) => selectedCategories.add(c));
+  return true;
+}
+
 async function doSearch(opts) {
   if (opts && opts.resetFacetState) { shopFacetState.clear(); selectedCategories.clear(); }
   const q = document.getElementById('q').value.trim();
@@ -838,6 +1425,7 @@ async function doSearch(opts) {
   const meta = document.getElementById('resultMeta');
   const loadMore = document.getElementById('loadMore');
   currentOffset = 0;
+  syncUrl(opts && opts.resetFacetState);
   if (!q) {
     results.innerHTML = ''; meta.textContent = ''; loadMore.style.display = 'none';
     renderShopFacets([]); renderCategoryFacets([]);
@@ -848,7 +1436,17 @@ async function doSearch(opts) {
   meta.textContent = '';
   loadMore.style.display = 'none';
 
-  const data = await (await fetch('/api/search?' + buildParams(0))).json();
+  let data;
+  try {
+    data = await runSearch(0);
+  } catch (err) {
+    if (err.name === 'AbortError') return;  // superseded on purpose, not a failure
+    results.innerHTML = searchErrorHtml(err);
+    document.getElementById('retrySearch')?.addEventListener('click', () => doSearch());
+    return;
+  }
+  if (!data) return;  // a newer search is already rendering
+
   currentTotal = data.total;
   currentOffset = data.results.length;
   renderShopFacets(data.venue_facets);
@@ -868,22 +1466,25 @@ async function loadMoreResults() {
   btn.disabled = true;
   btn.textContent = 'Loading...';
   try {
-    const data = await (await fetch('/api/search?' + buildParams(currentOffset))).json();
+    // Deliberately a plain fetch, not runSearch(): appending a page must not
+    // abort or be aborted by the primary search, and it has no stale-render
+    // problem because it only ever appends at the current offset.
+    const resp = await fetch('/api/search?' + buildParams(currentOffset));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
     const results = document.getElementById('results');
     results.insertAdjacentHTML('beforeend', data.results.map(venueCardHtml).join(''));
     currentOffset += data.results.length;
     document.getElementById('resultMeta').textContent = `Showing ${currentOffset} of ${currentTotal.toLocaleString()} matching venues`;
     btn.style.display = currentOffset < currentTotal ? 'block' : 'none';
+  } catch (err) {
+    document.getElementById('resultMeta').textContent = `Couldn't load more: ${err.message || err}`;
   } finally {
     btn.disabled = false;
     btn.textContent = 'Load more';
   }
 }
 
-function debounce(fn, ms) {
-  let handle;
-  return (...args) => { clearTimeout(handle); handle = setTimeout(() => fn(...args), ms); };
-}
 const debouncedSearch = debounce(() => doSearch(), 400);
 
 document.getElementById('go').addEventListener('click', () => doSearch({ resetFacetState: true }));
@@ -893,7 +1494,32 @@ document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'E
 ['onlyOpen', 'sort'].forEach(id => document.getElementById(id).addEventListener('change', () => doSearch()));
 ['minRating', 'minPrice', 'maxPrice'].forEach(id => document.getElementById(id).addEventListener('input', debouncedSearch));
 
-loadFilters();
+// Back/forward should reload the search that URL describes, not leave the page
+// showing results from a different query.
+window.addEventListener('popstate', () => {
+  shopFacetState.clear();
+  selectedCategories.clear();
+  restoreFromUrl();  // may be an empty URL: that's a legitimate "blank page" state
+  doSearch();
+});
+
+(async function init() {
+  try {
+    await loadFilters();
+  } catch (err) {
+    // A bare loadFilters() call used to swallow this: the filter checklists
+    // would just silently stay empty with no hint that anything had failed.
+    document.getElementById('results').innerHTML =
+      `<div class="empty-state">Couldn't load filters: ${esc(err.message || err)}.
+         Is the server still running? <button type="button" id="retryBoot" class="more-items"
+         style="margin-top:.6rem">Retry</button></div>`;
+    document.getElementById('retryBoot')?.addEventListener('click', () => location.reload());
+    return;
+  }
+  // Restore only after the checklists exist — region/product-line boxes are
+  // built from the API response above, so there's nothing to tick before this.
+  if (restoreFromUrl()) doSearch();
+})();
 </script>
 </body>
 </html>
@@ -906,49 +1532,119 @@ ADMIN_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wolt IL Search &mdash; Admin</title>
 <style>""" + _BASE_CSS + r"""
-  .layout { grid-template-columns: 1fr; max-width: 960px; }
+  .layout { grid-template-columns: 1fr; max-width: 1040px; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--border); font-size: 0.88rem; }
-  th { color: var(--text-muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
-  button.start { background: var(--green); color: white; border: none; border-radius: 999px; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 700; white-space: nowrap; }
-  button.stop { background: var(--red); color: white; border: none; border-radius: 999px; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 700; white-space: nowrap; }
-  .dot-status { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.4rem; }
-  .dot-status.running { background: var(--green); }
-  .dot-status.idle { background: #b0b3b8; }
-  .dot-status.done { background: var(--accent); }
-  .dot-status.failed { background: var(--red); }
-  pre { background: #0d1117; color: #d1d5db; padding: 0.7rem; border-radius: 8px; max-height: 260px; overflow: auto; font-size: 0.78rem; display: none; margin: 0.5rem 0 0.8rem 0; }
-  pre.shown { display: block; }
-  .toggle-log { font-size: 0.78rem; cursor: pointer; color: var(--accent); background: none; border: none; padding: 0; font-family: inherit; }
-  .toggle-log:focus-visible { outline: 2px solid var(--accent); border-radius: 2px; }
-  button.start:disabled, button.stop:disabled, .load-more:disabled { opacity: 0.6; cursor: not-allowed; }
-  .job-desc { color: var(--text-muted); font-size: 0.78rem; margin-top: 0.15rem; }
+  th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); font-size: 0.86rem; }
+  th { color: var(--text-muted); font-weight: 600; font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
-  .job-section-title { font-weight: 700; font-size: 0.9rem; margin: 1.5rem 0 0.4rem; }
-  .job-section-title:first-child { margin-top: 0; }
-  .job-row-flex {
-    display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem;
-    padding: 0.9rem 0; border-bottom: 1px solid var(--border);
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.8rem; }
+  .stat { background: var(--bg); border-radius: var(--radius-sm); padding: 0.6rem 0.75rem; }
+  .stat .k { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+  .stat .v { font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 0.15rem; }
+  .stat.warn .v { color: var(--red); }
+
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost {
+    background: none; color: var(--text-muted); border: 1px solid var(--border); border-radius: 999px;
+    padding: 0.4rem 0.9rem; font-size: 0.82rem; font-weight: 600; cursor: pointer; font-family: inherit;
   }
-  .job-row-flex:last-of-type { border-bottom: none; }
-  .job-info { flex: 1 1 220px; min-width: 200px; }
-  .job-controls-row { display: flex; gap: 0.6rem; flex-wrap: wrap; }
-  .job-controls-row .field { margin-bottom: 0; }
-  .job-controls-row .field label { margin-bottom: 0.2rem; white-space: nowrap; }
-  .job-controls-row .field input { width: 5.5rem; padding: 0.35rem 0.4rem; font-size: 0.85rem; }
-  .job-status-row { flex: 0 1 170px; min-width: 150px; font-size: 0.85rem; }
-  .job-actions-row { display: flex; align-items: center; }
+  button.ghost:hover { color: var(--accent); border-color: var(--accent); }
+  button.stop { background: var(--red); color: var(--bg); border: none; border-radius: 999px; padding: 0.35rem 0.9rem; cursor: pointer; font-weight: 700; }
+
+  /* ---- category picker ---- */
+  .cat-toolbar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.7rem; }
+  .cat-toolbar input[type="search"] {
+    flex: 1 1 180px; min-width: 150px; padding: 0.45rem 0.7rem; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: var(--bg); color: var(--text); font-size: 0.88rem; font-family: inherit;
+  }
+  .cat-group-title {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted);
+    font-weight: 700; margin: 0.9rem 0 0.35rem;
+  }
+  .cat-group-title:first-child { margin-top: 0; }
+  .cat-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 0.25rem 1rem; }
+  /* Layout only — the row's padding, gap, hover and focus come from the
+     shared .check-row primitive in _BASE_CSS, so a category row here and a
+     region row on the search page are the same control. */
+  .cat-row .cat-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cat-row .cat-meta { margin-left: auto; padding-left: 0.5rem; font-size: 0.74rem; color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cat-row .cat-meta b { color: var(--accent); font-weight: 700; }
+  .pill {
+    font-size: 0.66rem; font-weight: 700; letter-spacing: 0.02em; padding: 0.05rem 0.4rem;
+    border-radius: 999px; background: var(--accent-soft); color: var(--accent); text-transform: uppercase;
+  }
+  .selection-summary { font-size: 0.85rem; color: var(--text-muted); margin: 0.9rem 0 0.2rem; }
+  .selection-summary b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  details.advanced { margin-top: 0.9rem; border-top: 1px solid var(--border); padding-top: 0.7rem; }
+  details.advanced > summary {
+    cursor: pointer; font-size: 0.82rem; font-weight: 700; color: var(--accent); list-style: none;
+    display: flex; align-items: center; gap: 0.35rem;
+  }
+  details.advanced > summary::-webkit-details-marker { display: none; }
+  details.advanced > summary::before { content: '▸'; font-size: 0.75rem; }
+  details.advanced[open] > summary::before { content: '▾'; }
+  .adv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.8rem; margin-top: 0.8rem; }
+  .adv-grid .field label { display: flex; align-items: center; gap: 0.25rem; }
+  .adv-note { font-size: 0.74rem; color: var(--text-muted); margin-top: 0.15rem; }
+
+  .start-row { display: flex; align-items: center; gap: 0.9rem; margin-top: 1.1rem; flex-wrap: wrap; }
+  .start-hint { font-size: 0.8rem; color: var(--text-muted); }
+
+  /* ---- job cards ---- */
+  .job-card { background: var(--bg); border-radius: var(--radius); padding: 0.85rem 1rem; margin-bottom: 0.7rem; }
+  .job-card:last-child { margin-bottom: 0; }
+  .job-top { display: flex; align-items: flex-start; gap: 0.8rem; }
+  .job-title { font-weight: 700; font-size: 0.95rem; flex: 1; min-width: 0; }
+  .job-sub { color: var(--text-muted); font-size: 0.78rem; margin-top: 0.1rem; }
+  .dot-status { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.4rem; flex-shrink: 0; }
+  .dot-status.running { background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+  .dot-status.idle { background: var(--text-muted); }
+  .dot-status.done { background: var(--accent); }
+  .dot-status.failed, .dot-status.orphaned { background: var(--red); }
+  .dot-status.stopped { background: #d9a13b; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .job-state { font-size: 0.8rem; color: var(--text-muted); white-space: nowrap; }
+
+  .phase-line { display: flex; align-items: baseline; gap: 0.5rem; margin-top: 0.7rem; font-size: 0.85rem; }
+  .phase-name { font-weight: 600; }
+  .phase-step { color: var(--text-muted); font-size: 0.76rem; }
+  .bar { height: 0.5rem; background: var(--border); border-radius: 999px; overflow: hidden; margin-top: 0.4rem; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent-fill); border-radius: 999px; transition: width 0.35s ease; }
+  .bar.indeterminate > i { width: 35% !important; animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+  .counters { display: flex; flex-wrap: wrap; gap: 0.15rem 1rem; margin-top: 0.45rem; font-size: 0.78rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .counters b { color: var(--text); font-weight: 600; }
+  .counters .warn b { color: var(--red); }
+  .current-line {
+    margin-top: 0.4rem; font-size: 0.8rem; color: var(--text-muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .current-line code { color: var(--accent); background: var(--accent-soft); padding: 0.05rem 0.35rem; border-radius: 4px; }
+  .backoff-note { margin-top: 0.4rem; font-size: 0.78rem; color: #f0c674; }
+  .job-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.7rem; }
+
+  pre.joblog {
+    background: #05070f; color: #d1d5db; padding: 0.6rem 0.75rem; border-radius: var(--radius-sm);
+    max-height: 300px; overflow: auto; font-size: 0.76rem; line-height: 1.5; margin: 0.6rem 0 0;
+    white-space: pre-wrap; word-break: break-word; display: none;
+  }
+  pre.joblog.shown { display: block; }
+  .empty-note { color: var(--text-muted); font-size: 0.87rem; padding: 0.4rem 0; }
+
   .info-icon {
     display: inline-flex; align-items: center; justify-content: center;
     width: 0.95rem; height: 0.95rem; border-radius: 50%; position: relative;
     background: var(--border); color: var(--text-muted); font-size: 0.65rem; font-weight: 700;
-    cursor: help; margin-left: 0.15rem; flex-shrink: 0; vertical-align: middle;
+    cursor: help; flex-shrink: 0;
   }
   .info-icon:hover::after, .info-icon:focus-visible::after {
     content: attr(data-tip); position: absolute; bottom: 135%; left: 50%; transform: translateX(-50%);
-    background: var(--text); color: var(--bg); padding: 0.4rem 0.6rem; border-radius: 6px;
-    font-size: 0.72rem; font-weight: 400; white-space: normal; width: 14rem;
-    box-shadow: var(--shadow); z-index: 20; pointer-events: none;
+    background: var(--text); color: var(--bg); padding: 0.45rem 0.65rem; border-radius: 6px;
+    font-size: 0.72rem; font-weight: 400; white-space: normal; width: 16rem; text-transform: none;
+    letter-spacing: 0; box-shadow: var(--shadow); z-index: 20; pointer-events: none;
   }
   .info-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>
@@ -957,175 +1653,587 @@ ADMIN_HTML = r"""<!doctype html>
 <div class="topbar">
   <div class="brand">Wolt IL <span class="dot">Search</span></div>
   <div style="display:flex; align-items:center; gap:1rem;">
+    <span class="stats" id="headerStats"></span>
     <nav><a href="/">&larr; Search</a></nav>
   </div>
 </div>
 <div class="layout">
+
   <div class="panel">
-    <div class="panel-header">Cache status</div>
-    <div class="panel-body"><table id="statusTable"></table></div>
-  </div>
-  <div class="panel">
-    <div class="panel-header">By category</div>
+    <div class="panel-header">New crawl job</div>
     <div class="panel-body">
-      <table><thead><tr><th>product_line</th><th>venues</th><th>with items</th></tr></thead><tbody id="plBody"></tbody></table>
+      <div class="cat-toolbar">
+        <input type="search" id="catFilter" placeholder="Filter categories…" autocomplete="off">
+        <button type="button" class="ghost" id="selPending">Select all with pending</button>
+        <button type="button" class="ghost" id="selClear">Clear</button>
+        <label class="check-row"><input type="checkbox" id="showCurated"> show curated &amp; cuisine lists</label>
+        <button type="button" class="ghost" id="refreshCats" title="Re-read Wolt's front page for new verticals/categories">↻ Wolt</button>
+      </div>
+      <div id="catList"></div>
+
+      <div class="selection-summary" id="selectionSummary"></div>
+
+      <details class="advanced" id="advanced">
+        <summary>Advanced settings</summary>
+        <div class="adv-grid">
+          <div class="field">
+            <label for="advPhases">Phases <span class="info-icon" tabindex="0" data-tip="Discover = re-list which venues exist in each region. Items = fetch each venue's menu/catalog. Both is the default.">ⓘ</span></label>
+            <select id="advPhases">
+              <option value="discover,items">Discover + items</option>
+              <option value="items">Items only</option>
+              <option value="discover">Discover only</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="advLimit">Max venues <span class="info-icon" tabindex="0" data-tip="Leave at 0 to crawl the entire selection, which is the default. Set a number only when you want a small test batch.">ⓘ</span></label>
+            <input type="number" id="advLimit" min="0" step="10" value="0">
+            <div class="adv-note">0 = whole category</div>
+          </div>
+          <div class="field">
+            <label for="advMaxAge">Re-fetch older than (h) <span class="info-icon" tabindex="0" data-tip="Venues fetched more recently than this are skipped. Lower catches price/availability changes sooner; higher skips anything crawled recently.">ⓘ</span></label>
+            <input type="number" id="advMaxAge" min="0" step="1" value="168">
+          </div>
+          <div class="field">
+            <label for="advDelay">Base delay (s) <span class="info-icon" tabindex="0" data-tip="Minimum gap between requests to Wolt. This is a floor, not a fixed value — the crawler widens the gap automatically while Wolt rate-limits and recovers afterwards.">ⓘ</span></label>
+            <input type="number" id="advDelay" min="0.5" max="30" step="0.1" value="1.2">
+          </div>
+          <div class="field">
+            <label for="advMaxDelay">Backoff ceiling (s) <span class="info-icon" tabindex="0" data-tip="Upper bound for exponential backoff between retries and for the adaptive pacing.">ⓘ</span></label>
+            <input type="number" id="advMaxDelay" min="5" max="300" step="5" value="60">
+          </div>
+          <div class="field">
+            <label for="advAttempts">Attempts per request <span class="info-icon" tabindex="0" data-tip="Tries per HTTP request before the venue is recorded as failed and retried in a later run. Waits grow exponentially (2s, 4s, 8s…) with jitter, and honor Retry-After.">ⓘ</span></label>
+            <input type="number" id="advAttempts" min="1" max="8" step="1" value="4">
+          </div>
+          <div class="field">
+            <label class="check-row" for="advForce">
+              <input type="checkbox" id="advForce">
+              Force re-crawl
+              <span class="info-icon" tabindex="0" data-tip="Ignore freshness entirely and re-fetch every venue in the selection, even ones crawled minutes ago.">ⓘ</span>
+            </label>
+          </div>
+        </div>
+      </details>
+
+      <div class="start-row">
+        <button class="primary" id="startBtn" disabled>Start crawl</button>
+        <span class="start-hint" id="startHint"></span>
+      </div>
     </div>
   </div>
+
   <div class="panel">
-    <div class="panel-header">Crawl jobs</div>
-    <div class="panel-body" id="jobSections"></div>
+    <div class="panel-header">Jobs</div>
+    <div class="panel-body" id="jobList"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">Cache status</div>
+    <div class="panel-body">
+      <div class="stat-grid" id="statGrid"></div>
+      <table style="margin-top:1rem">
+        <thead><tr>
+          <th>product line</th><th class="num">venues</th><th class="num">with items</th>
+          <th class="num" title="Fetched successfully but hold zero items — the scrape fallback targets these">empty</th>
+          <th class="num">pending</th><th class="num">retrying</th><th class="num">gave up</th>
+        </tr></thead>
+        <tbody id="plBody"></tbody>
+      </table>
+      <div class="start-row">
+        <button type="button" class="ghost" id="reindexBtn">Rebuild search index</button>
+        <span class="start-hint">Every crawl already reindexes on completion.</span>
+      </div>
+    </div>
   </div>
 </div>
 
-<script>
-const SECTION_TITLES = {
-  quickstart: 'Quick start',
-  setup: '1. Setup — region &amp; venue discovery',
-  refresh: '2. Refresh items — run periodically to pick up new/changed/removed items',
-  maintenance: '3. Maintenance',
-};
-const SECTION_ORDER = ['quickstart', 'setup', 'refresh', 'maintenance'];
+<script>""" + _BASE_JS + r"""
+// ---------------------------------------------------------------------------
+// Rendering rule for this page: build each node once, then patch it in place.
+// The previous version reassigned innerHTML on the whole job container every
+// 5s, which destroyed and recreated every input and every log pane — that's
+// what made the page jitter, dropped focus while typing, and reset the log's
+// scroll position on every poll.
+// ---------------------------------------------------------------------------
+const POLL_MS = 1500;
+const els = {};              // cached static nodes
+const jobCards = new Map();  // job id -> {root, refs...}
+let categories = [];
+let selected = new Set();
+let openLogs = new Map();    // job id -> last seen line seq
+let starting = false;
 
-let jobsMeta = {};  // name -> {section, description, has_limit, has_max_age, default_limit, default_max_age_hours, heavy}, loaded once
+const $ = (id) => document.getElementById(id);
 
-function fmtStarted(ts) { return ts ? new Date(ts * 1000).toLocaleTimeString() : ''; }
+function fmtDuration(seconds) {
+  if (seconds == null || !isFinite(seconds)) return '—';
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+function fmtClock(ts) { return ts ? new Date(ts * 1000).toLocaleTimeString() : ''; }
 
-const FIELD_TIPS = {
-  limit: 'Max number of venues to process in this one run.',
-  maxage: 'Only re-fetch venues whose data is older than this many hours. Lower catches price/availability changes and removed items sooner; higher (or very large) skips anything fetched recently.',
-  delay: 'Seconds to wait between requests to Wolt, so this crawl doesn’t hammer their servers.',
-};
-function infoIcon(key) {
-  return `<span class="info-icon" tabindex="0" data-tip="${FIELD_TIPS[key]}">ⓘ</span>`;
+// --- category picker -------------------------------------------------------
+function catGroup(cat) {
+  if (cat.kind === 'product_line') return 'Product lines (item crawls)';
+  if (cat.kind === 'wolt_category') return 'Wolt cuisine/type categories';
+  return cat.primary ? 'Main verticals' : 'Other Wolt verticals';
+}
+const GROUP_ORDER = [
+  'Main verticals',
+  'Product lines (item crawls)',
+  'Other Wolt verticals',
+  'Wolt cuisine/type categories',
+];
+
+function renderCategories() {
+  const filter = els.catFilter.value.trim().toLowerCase();
+  const showCurated = els.showCurated.checked;
+  const groups = new Map(GROUP_ORDER.map((g) => [g, []]));
+
+  categories.forEach((cat) => {
+    const hideable = cat.curated || cat.kind === 'wolt_category';
+    if (hideable && !showCurated && !selected.has(cat.key)) return;
+    if (filter && !(`${cat.label} ${cat.key}`.toLowerCase().includes(filter))) return;
+    groups.get(catGroup(cat))?.push(cat);
+  });
+
+  const frag = document.createDocumentFragment();
+  GROUP_ORDER.forEach((name) => {
+    const items = groups.get(name);
+    if (!items || !items.length) return;
+    const title = document.createElement('div');
+    title.className = 'cat-group-title';
+    title.textContent = `${name} (${items.length})`;
+    frag.appendChild(title);
+    const list = document.createElement('div');
+    list.className = 'cat-list';
+    items.forEach((cat) => list.appendChild(catRow(cat)));
+    frag.appendChild(list);
+  });
+  if (!frag.childNodes.length) {
+    const note = document.createElement('div');
+    note.className = 'empty-note';
+    note.textContent = 'No categories match that filter.';
+    frag.appendChild(note);
+  }
+  // Whole-list rebuild is fine here: this only re-runs on explicit user
+  // interaction (typing a filter, toggling a checkbox), never on a timer.
+  els.catList.replaceChildren(frag);
 }
 
-// The status poll rebuilds every job row's HTML from scratch every 5s, which
-// would otherwise silently overwrite anything you'd typed into these inputs
-// before hitting Start. Read whatever's currently on screen first, and only
-// fall back to the server-remembered default for a row's very first render.
-function currentInputValue(id, fallback) {
-  const el = document.getElementById(id);
-  return el ? el.value : fallback;
+function catRow(cat) {
+  const row = document.createElement('label');
+  row.className = 'check-row cat-row';
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = selected.has(cat.key);
+  box.addEventListener('change', () => {
+    if (box.checked) selected.add(cat.key); else selected.delete(cat.key);
+    updateSelectionSummary();
+  });
+  const label = document.createElement('span');
+  label.className = 'cat-label';
+  label.textContent = cat.label;
+  if (cat.source === 'wolt') {
+    const pill = document.createElement('span');
+    pill.className = 'pill';
+    pill.textContent = 'wolt';
+    pill.title = 'Discovered live from Wolt\'s front-page API';
+    label.appendChild(document.createTextNode(' '));
+    label.appendChild(pill);
+  }
+  const meta = document.createElement('span');
+  meta.className = 'cat-meta';
+  if (cat.venues) {
+    meta.innerHTML = cat.pending
+      ? `${fmtInt(cat.with_items)}/${fmtInt(cat.venues)} · <b>${fmtInt(cat.pending)} pending</b>`
+      : `${fmtInt(cat.with_items)}/${fmtInt(cat.venues)}`;
+  } else {
+    meta.textContent = 'not crawled yet';
+  }
+  row.append(box, label, meta);
+  return row;
 }
 
-function jobRowHtml(name, meta, s) {
-  const dotClass = s.running ? 'running' : (s.returncode == null ? 'idle' : (s.returncode === 0 ? 'done' : 'failed'));
-  const label = s.running ? `running since ${fmtStarted(s.started_at)}`
-    : (s.returncode != null ? `exited (code ${s.returncode})` : 'idle');
-  const logShown = document.getElementById(`log-${name}`)?.classList.contains('shown');
+function updateSelectionSummary() {
+  const chosen = categories.filter((c) => selected.has(c.key));
+  const pending = chosen.reduce((sum, c) => sum + (c.pending || 0), 0);
+  const venues = chosen.reduce((sum, c) => sum + (c.venues || 0), 0);
+  els.selectionSummary.innerHTML = chosen.length
+    ? `Selected <b>${chosen.length}</b> categor${chosen.length === 1 ? 'y' : 'ies'} — about <b>${fmtInt(pending)}</b> venues still need items (of <b>${fmtInt(venues)}</b> known).`
+    : 'Select one or more categories to crawl. The whole selection is crawled by default — no venue cap needed.';
+  els.startBtn.disabled = !chosen.length || starting;
+}
 
-  const limitVal = currentInputValue(`limit-${name}`, meta.default_limit);
-  const maxAgeVal = currentInputValue(`maxage-${name}`, meta.default_max_age_hours);
-  const delayVal = currentInputValue(`delay-${name}`, meta.default_delay);
-
-  const controls = [];
-  if (meta.has_limit) {
-    controls.push(`<div class="field"><label for="limit-${name}">Limit${infoIcon('limit')}</label><input type="number" min="1" id="limit-${name}" value="${limitVal}"></div>`);
-  }
-  if (meta.has_max_age) {
-    controls.push(`<div class="field"><label for="maxage-${name}">Max age (h)${infoIcon('maxage')}</label><input type="number" min="0" id="maxage-${name}" value="${maxAgeVal}"></div>`);
-  }
-  controls.push(`<div class="field"><label for="delay-${name}">Delay (s)${infoIcon('delay')}</label><input type="number" min="0.5" step="0.1" id="delay-${name}" value="${delayVal}"></div>`);
-
-  const html = `
-    <div class="job-row-flex" data-job="${name}">
-      <div class="job-info"><strong>${name}</strong><div class="job-desc">${meta.description}</div></div>
-      <div class="job-controls-row">${controls.join('')}</div>
-      <div class="job-status-row">
-        <span class="dot-status ${dotClass}"></span>${label}<br>
-        <button type="button" class="toggle-log" id="toggle-log-${name}" onclick="toggleLog('${name}')">${logShown ? 'hide log' : 'show log'}</button>
+// --- job cards -------------------------------------------------------------
+function buildJobCard(job) {
+  const root = document.createElement('div');
+  root.className = 'job-card';
+  root.innerHTML = `
+    <div class="job-top">
+      <div style="flex:1; min-width:0">
+        <div class="job-title"></div>
+        <div class="job-sub"></div>
       </div>
-      <div class="job-actions-row">${s.running
-        ? `<button class="stop" onclick="stopJob('${name}')">Stop</button>`
-        : `<button class="start" onclick="startJob('${name}')">Start</button>`}</div>
+      <div class="job-state"><span class="dot-status"></span><span class="state-label"></span></div>
     </div>
-    <pre id="log-${name}" class="${logShown ? 'shown' : ''}"></pre>
+    <div class="phase-line">
+      <span class="phase-name"></span><span class="phase-step"></span>
+    </div>
+    <div class="bar"><i></i></div>
+    <div class="counters">
+      <span>done <b class="c-done">0</b></span>
+      <span>ok <b class="c-ok">0</b></span>
+      <span class="warn">failed <b class="c-fail">0</b></span>
+      <span>items <b class="c-items">0</b></span>
+      <span>elapsed <b class="c-elapsed">—</b></span>
+      <span>eta <b class="c-eta">—</b></span>
+    </div>
+    <div class="current-line"></div>
+    <div class="backoff-note" hidden></div>
+    <div class="job-actions">
+      <button type="button" class="ghost toggle-log">show log</button>
+      <button type="button" class="stop" hidden>Stop</button>
+    </div>
+    <pre class="joblog"></pre>
   `;
-  return { html, logShown };
+  const refs = {
+    root,
+    title: root.querySelector('.job-title'),
+    sub: root.querySelector('.job-sub'),
+    dot: root.querySelector('.dot-status'),
+    stateLabel: root.querySelector('.state-label'),
+    phaseName: root.querySelector('.phase-name'),
+    phaseStep: root.querySelector('.phase-step'),
+    bar: root.querySelector('.bar'),
+    barFill: root.querySelector('.bar > i'),
+    cDone: root.querySelector('.c-done'),
+    cOk: root.querySelector('.c-ok'),
+    cFail: root.querySelector('.c-fail'),
+    cItems: root.querySelector('.c-items'),
+    cElapsed: root.querySelector('.c-elapsed'),
+    cEta: root.querySelector('.c-eta'),
+    current: root.querySelector('.current-line'),
+    backoff: root.querySelector('.backoff-note'),
+    toggleLog: root.querySelector('.toggle-log'),
+    stopBtn: root.querySelector('.stop'),
+    log: root.querySelector('.joblog'),
+  };
+  refs.toggleLog.addEventListener('click', () => toggleLog(job.id, refs));
+  refs.stopBtn.addEventListener('click', async () => {
+    refs.stopBtn.disabled = true;
+    refs.stopBtn.textContent = 'Stopping…';
+    await fetch(`/api/jobs/${job.id}/stop`, { method: 'POST' });
+    refresh();
+  });
+  return refs;
 }
 
-async function loadJobsMeta() {
-  jobsMeta = await (await fetch('/api/jobs/meta')).json();
+function setHidden(node, hidden) {
+  if (node.hidden !== hidden) node.hidden = hidden;
 }
 
-async function refreshStatus() {
-  const status = await (await fetch('/api/status')).json();
-  document.getElementById('statusTable').innerHTML = `
-    <tr><th>Regions</th><td>${status.regions}</td></tr>
-    <tr><th>Venues</th><td>${status.venues.toLocaleString()}</td></tr>
-    <tr><th>Venues with items</th><td>${status.venues_with_menu.toLocaleString()}</td></tr>
-    <tr><th>Menu items</th><td>${status.menu_items.toLocaleString()}</td></tr>
-  `;
-  document.getElementById('plBody').innerHTML = status.by_product_line.map(p => `
-    <tr><td>${p.product_line ?? '(none)'}</td><td>${p.total.toLocaleString()}</td><td>${p.fetched.toLocaleString()}</td></tr>
-  `).join('');
+function updateJobCard(refs, job) {
+  const p = job.progress || {};
+  const running = job.state === 'running';
+  const elapsedTo = job.finished_at || Date.now() / 1000;
 
-  const bySection = {};
-  SECTION_ORDER.forEach(sec => { bySection[sec] = []; });
-  Object.keys(jobsMeta).forEach(name => { bySection[jobsMeta[name].section]?.push(name); });
+  setText(refs.title, job.title || job.kind);
+  const params = job.params || {};
+  const bits = [];
+  if (params.phases) bits.push(params.phases.join(' + '));
+  bits.push(params.limit ? `limit ${fmtInt(params.limit)}` : 'whole selection');
+  if (params.force) bits.push('forced');
+  if (params.delay) bits.push(`${params.delay}s base delay`);
+  setText(refs.sub, `${bits.join(' · ')} — started ${fmtClock(job.created_at)}`);
 
-  const shownLogs = [];
-  document.getElementById('jobSections').innerHTML = SECTION_ORDER
-    .filter(sec => bySection[sec].length)
-    .map(sec => {
-      const rows = bySection[sec].map(name => {
-        const { html, logShown } = jobRowHtml(name, jobsMeta[name], status.jobs[name]);
-        if (logShown) shownLogs.push(name);
-        return html;
-      }).join('');
-      return `<div class="job-section-title">${SECTION_TITLES[sec]}</div>${rows}`;
-    }).join('');
+  if (refs.dot.className !== `dot-status ${job.state}`) refs.dot.className = `dot-status ${job.state}`;
+  let stateText = job.state;
+  if (running) stateText = 'running';
+  else if (job.state === 'done') stateText = 'finished';
+  else if (job.state === 'failed') stateText = `failed (code ${job.returncode})`;
+  else if (job.state === 'orphaned') stateText = 'lost (process gone)';
+  setText(refs.stateLabel, stateText);
 
-  // The <pre> above is rebuilt empty every poll — refill any pane that was open.
-  shownLogs.forEach(async (name) => {
-    const data = await (await fetch(`/api/jobs/${name}/log?lines=100`)).json();
-    const pre = document.getElementById(`log-${name}`);
-    if (pre) pre.textContent = data.log || '(no output yet)';
+  // Phase / progress
+  const phase = p.phase || (running ? 'starting…' : '—');
+  setText(refs.phaseName, phase);
+  setText(refs.phaseStep, p.phase_of ? `step ${p.phase_index}/${p.phase_of}` : '');
+
+  const n = p.n || 0;
+  const i = p.i || 0;
+  // A finished job shows the bar full rather than whatever fraction its last
+  // phase happened to reach — a trailing phase with nothing to do would
+  // otherwise leave a completed crawl looking like it stalled at 0%.
+  const pct = !running && job.state === 'done' ? 100 : (n > 0 ? Math.min(100, (i / n) * 100) : 0);
+  const indeterminate = running && n === 0;
+  refs.bar.classList.toggle('indeterminate', indeterminate);
+  const width = indeterminate ? '35%' : `${pct}%`;
+  if (refs.barFill.style.width !== width) refs.barFill.style.width = width;
+
+  // While running, the counters describe the phase the bar is showing.
+  // Once finished, they describe the whole job.
+  const ok = running ? p.ok : (p.cum_ok || 0) + (p.ok || 0);
+  const failed = running ? p.failed : (p.cum_failed || 0) + (p.failed || 0);
+  const items = running ? p.items : (p.cum_items || 0) + (p.items || 0);
+  setText(refs.cDone, running ? (n ? `${fmtInt(i)}/${fmtInt(n)}` : fmtInt(i)) : fmtInt(ok + failed));
+  setText(refs.cOk, fmtInt(ok));
+  setText(refs.cFail, fmtInt(failed));
+  setText(refs.cItems, fmtInt(items));
+  setText(refs.cElapsed, fmtDuration(elapsedTo - job.created_at));
+  setText(refs.cEta, running ? fmtDuration(p.eta_seconds) : '—');
+
+  // "What is it doing right now" — the question the old page couldn't answer.
+  if (running && p.current) {
+    refs.current.innerHTML = `working on <code></code>`;
+    refs.current.querySelector('code').textContent = p.current;
+  } else if (!running && p.summary) {
+    const s = p.summary;
+    setText(refs.current,
+      `summary: ${fmtInt(s.venues_found)} venues found, ${fmtInt(s.items_succeeded)}/${fmtInt(s.items_attempted)} item fetches ok`);
+  } else if (p.last_error) {
+    setText(refs.current, `last error: ${p.last_error}`);
+  } else {
+    setText(refs.current, '');
+  }
+
+  // Backoff visibility: a crawl that's waiting should say so, not look frozen.
+  const retry = p.last_retry;
+  const recent = retry && (Date.now() / 1000 - (retry.at || 0) < 90);
+  setHidden(refs.backoff, !(running && recent));
+  if (running && recent) {
+    setText(refs.backoff,
+      `⏳ ${retry.reason} — backing off ${retry.wait}s (attempt ${retry.attempt}/${retry.of}, pacing now ${retry.pacing}s, ${p.retries} retries this run)`);
+  }
+
+  setHidden(refs.stopBtn, !running);
+  if (!running && refs.stopBtn.disabled) { refs.stopBtn.disabled = false; refs.stopBtn.textContent = 'Stop'; }
+}
+
+async function toggleLog(jobId, refs) {
+  if (openLogs.has(jobId)) {
+    openLogs.delete(jobId);
+    refs.log.classList.remove('shown');
+    refs.toggleLog.textContent = 'show log';
+    return;
+  }
+  openLogs.set(jobId, 0);
+  refs.log.textContent = '';
+  refs.log.classList.add('shown');
+  refs.toggleLog.textContent = 'hide log';
+  await pumpLog(jobId, refs);
+}
+
+async function pumpLog(jobId, refs) {
+  const after = openLogs.get(jobId);
+  if (after === undefined) return;
+  let data;
+  try {
+    data = await (await fetch(`/api/jobs/${jobId}/log?after=${after}`)).json();
+  } catch (e) { return; }
+  openLogs.set(jobId, data.seq || after);
+  if (!data.lines || !data.lines.length) {
+    if (!refs.log.textContent) refs.log.textContent = '(no output yet)';
+    return;
+  }
+  // Sticky auto-tail: only scroll if the operator was already at the bottom,
+  // so reading back through history isn't yanked away on the next poll.
+  const atBottom = refs.log.scrollHeight - refs.log.scrollTop - refs.log.clientHeight < 24;
+  if (refs.log.textContent === '(no output yet)') refs.log.textContent = '';
+  if (data.gap) refs.log.append('… (older lines dropped)\n');
+  refs.log.append(data.lines.map((l) => l.text).join('\n') + '\n');
+  if (atBottom) refs.log.scrollTop = refs.log.scrollHeight;
+}
+
+function renderJobs(jobs) {
+  const seen = new Set();
+  jobs.forEach((job, index) => {
+    seen.add(job.id);
+    let refs = jobCards.get(job.id);
+    if (!refs) {
+      refs = buildJobCard(job);
+      jobCards.set(job.id, refs);
+    }
+    updateJobCard(refs, job);
+    // Keep DOM order in sync with server order without touching innards.
+    const currentAt = els.jobList.children[index];
+    if (currentAt !== refs.root) els.jobList.insertBefore(refs.root, currentAt || null);
+    if (openLogs.has(job.id)) pumpLog(job.id, refs);
+  });
+  jobCards.forEach((refs, id) => {
+    if (!seen.has(id)) { refs.root.remove(); jobCards.delete(id); openLogs.delete(id); }
+  });
+  if (!jobs.length) {
+    if (!els.jobList.querySelector('.empty-note')) {
+      const note = document.createElement('div');
+      note.className = 'empty-note';
+      note.textContent = 'No jobs yet. Pick categories above and press Start crawl.';
+      els.jobList.appendChild(note);
+    }
+  } else {
+    els.jobList.querySelector('.empty-note')?.remove();
+  }
+}
+
+// --- cache status ----------------------------------------------------------
+function renderCounts(counts) {
+  const stats = [
+    ['Regions', counts.regions, false],
+    ['Venues', counts.venues, false],
+    ['With items', counts.venues_with_menu, false],
+    ['Items', counts.menu_items, false],
+    ['Pending', counts.venues_pending, false],
+    ['Retrying', counts.venues_retrying, counts.venues_retrying > 0],
+    ['Gave up', counts.venues_gave_up, counts.venues_gave_up > 0],
+  ];
+  if (!els.statGrid.children.length) {
+    stats.forEach(([k]) => {
+      const box = document.createElement('div');
+      box.className = 'stat';
+      box.innerHTML = `<div class="k"></div><div class="v"></div>`;
+      box.querySelector('.k').textContent = k;
+      els.statGrid.appendChild(box);
+    });
+  }
+  stats.forEach(([, v, warn], idx) => {
+    const box = els.statGrid.children[idx];
+    setText(box.querySelector('.v'), fmtInt(v));
+    box.classList.toggle('warn', !!warn);
+  });
+  setText(els.headerStats, `${fmtInt(counts.venues)} venues · ${fmtInt(counts.menu_items)} items`);
+
+  const rows = counts.by_product_line || [];
+  while (els.plBody.rows.length > rows.length) els.plBody.deleteRow(-1);
+  rows.forEach((row, idx) => {
+    let tr = els.plBody.rows[idx];
+    if (!tr) {
+      tr = els.plBody.insertRow();
+      tr.innerHTML = '<td></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td>';
+    }
+    const cells = tr.cells;
+    setText(cells[0], row.product_line ?? '(none)');
+    setText(cells[1], fmtInt(row.total));
+    setText(cells[2], fmtInt(row.with_items));
+    setText(cells[3], fmtInt(row.empty));
+    setText(cells[4], fmtInt(row.pending));
+    setText(cells[5], fmtInt(row.retrying));
+    setText(cells[6], fmtInt(row.gave_up));
   });
 }
 
-async function startJob(name) {
-  const meta = jobsMeta[name];
-  if (meta.heavy && !confirm(`Start "${name}"? This hits Wolt for many venues and can run for several minutes.`)) {
-    return;
-  }
-  const params = new URLSearchParams();
-  const limitInput = document.getElementById(`limit-${name}`);
-  const maxAgeInput = document.getElementById(`maxage-${name}`);
-  const delayInput = document.getElementById(`delay-${name}`);
-  if (limitInput) params.set('limit', limitInput.value);
-  if (maxAgeInput) params.set('max_age_hours', maxAgeInput.value);
-  if (delayInput) params.set('delay', delayInput.value);
+// --- polling ---------------------------------------------------------------
+let categoriesSignature = '';
 
-  const btn = document.querySelector(`.job-row-flex[data-job="${name}"] button.start`);
-  if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
-  await fetch(`/api/jobs/${name}/start?${params}`, { method: 'POST' });
-  refreshStatus();
+async function refresh() {
+  let state;
+  try {
+    state = await (await fetch('/api/admin/state')).json();
+  } catch (e) { return; }
+
+  renderCounts(state.counts);
+  renderJobs(state.jobs || []);
+
+  // Only re-render the picker when the category data actually changed —
+  // otherwise a poll would blow away a half-typed filter or a checkbox the
+  // operator just clicked.
+  const signature = JSON.stringify((state.categories || []).map((c) => [c.key, c.venues, c.with_items, c.pending]));
+  if (signature !== categoriesSignature) {
+    categoriesSignature = signature;
+    categories = state.categories || [];
+    renderCategories();
+    updateSelectionSummary();
+  }
+
+  const limits = state.limits || {};
+  const full = (limits.running || 0) >= (limits.max_concurrent || 3);
+  els.startHint.textContent = full
+    ? `${limits.running}/${limits.max_concurrent} jobs running — stop one before starting another.`
+    : (selected.size ? '' : '');
+  if (full) els.startBtn.disabled = true; else updateSelectionSummary();
 }
 
-async function stopJob(name) {
-  await fetch(`/api/jobs/${name}/stop`, { method: 'POST' });
-  refreshStatus();
-}
-
-async function toggleLog(name) {
-  const pre = document.getElementById(`log-${name}`);
-  const btn = document.getElementById(`toggle-log-${name}`);
-  if (pre.classList.contains('shown')) {
-    pre.classList.remove('shown');
-    if (btn) btn.textContent = 'show log';
-    return;
+async function startCrawl() {
+  starting = true;
+  els.startBtn.disabled = true;
+  els.startBtn.textContent = 'Starting…';
+  const body = {
+    categories: [...selected],
+    phases: els.advPhases.value.split(','),
+    limit: Number(els.advLimit.value || 0),
+    max_age_hours: Number(els.advMaxAge.value || 168),
+    delay: Number(els.advDelay.value || 1.2),
+    max_delay: Number(els.advMaxDelay.value || 60),
+    max_attempts: Number(els.advAttempts.value || 4),
+    force: els.advForce.checked,
+  };
+  try {
+    const resp = await fetch('/api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      els.startHint.textContent = err.detail || `Failed to start (HTTP ${resp.status})`;
+    }
+  } finally {
+    starting = false;
+    els.startBtn.textContent = 'Start crawl';
+    await refresh();
   }
-  const data = await (await fetch(`/api/jobs/${name}/log?lines=100`)).json();
-  pre.textContent = data.log || '(no output yet)';
-  pre.classList.add('shown');
-  if (btn) btn.textContent = 'hide log';
 }
 
 (async function init() {
-  await loadJobsMeta();
-  await refreshStatus();
-  setInterval(refreshStatus, 5000);
+  ['catFilter', 'showCurated', 'catList', 'selectionSummary', 'startBtn', 'startHint', 'jobList',
+   'statGrid', 'plBody', 'headerStats', 'advPhases', 'advLimit', 'advMaxAge', 'advDelay',
+   'advMaxDelay', 'advAttempts', 'advForce'].forEach((id) => { els[id] = $(id); });
+
+  els.catFilter.addEventListener('input', renderCategories);
+  els.showCurated.addEventListener('change', renderCategories);
+  els.startBtn.addEventListener('click', startCrawl);
+  $('selClear').addEventListener('click', () => { selected.clear(); renderCategories(); updateSelectionSummary(); });
+  $('selPending').addEventListener('click', () => {
+    categories.filter((c) => c.kind === 'product_line' && c.pending > 0).forEach((c) => selected.add(c.key));
+    renderCategories();
+    updateSelectionSummary();
+  });
+  $('refreshCats').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    e.target.textContent = '↻ …';
+    try {
+      const data = await (await fetch('/api/categories?refresh=true')).json();
+      categories = data.categories || [];
+      categoriesSignature = '';
+      renderCategories();
+      updateSelectionSummary();
+    } finally {
+      e.target.disabled = false;
+      e.target.textContent = '↻ Wolt';
+    }
+  });
+  $('reindexBtn').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    await fetch('/api/jobs/reindex', { method: 'POST' });
+    e.target.disabled = false;
+    refresh();
+  });
+
+  // Restore the advanced settings the operator used last time.
+  try {
+    const d = await (await fetch('/api/jobs/defaults')).json();
+    els.advLimit.value = d.limit ?? 0;
+    els.advMaxAge.value = d.max_age_hours ?? 168;
+    els.advDelay.value = d.delay ?? 1.2;
+    els.advMaxDelay.value = d.max_delay ?? 60;
+    els.advAttempts.value = d.max_attempts ?? 4;
+    if (d.phases) els.advPhases.value = d.phases.join(',');
+  } catch (e) { /* defaults already in the markup */ }
+
+  await refresh();
+  setInterval(refresh, POLL_MS);
 })();
 </script>
 </body>
