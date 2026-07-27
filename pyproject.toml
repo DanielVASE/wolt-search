@@ -1,6 +1,6 @@
 [project]
 name = "wolt-il-search-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "Nationwide (Israel) Wolt venue + menu search, with a local cache and an MCP server front-end."
 requires-python = ">=3.10"
 dependencies = [

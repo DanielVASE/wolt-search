@@ -22,7 +22,7 @@ by word order or typos). This project:
 4. Runs real full-text search (SQLite FTS5 + BM25 ranking) over that local
    cache — instant, not scoped to any one region, and not thrown by word
    order the way Wolt's own in-app search is.
-5. Exposes `search` as an MCP tool so you can just ask Claude things like
+5. Exposes `search` and friends as MCP tools so you can just ask Claude things like
    *"find sushi places open right now in Haifa"*, *"who sells shakshuka near
    Jerusalem"*, or *"find a gaming laptop with an RTX 5070"*.
 
@@ -212,10 +212,14 @@ For Claude Desktop, add the same block to
 
 | Tool | Description |
 |---|---|
-| `search` | Full-text search venues + menu items nationwide (or within one region), from the local cache. |
-| `list_regions` | The 24 Wolt Israel region slugs, for `search(region=...)`. |
-| `cache_status` | Region/venue/menu counts, to sanity-check freshness. |
-| `get_menu_live` | Live (uncached) menu fetch for one venue slug, for prices right before ordering. |
+| `search` | Full-text search venues + menu items nationwide, from the local cache. Goes through the same `search_full()` entry point as the web UI, so it takes the same filters (`regions`, `product_lines`, `include_venues`, `exclude_venues`, `categories`, `min_price`/`max_price`, `min_rating`, `only_open`, `sort`) and returns the true `total` plus `offset`/`limit` for paging. |
+| `list_regions` | The 24 Wolt Israel region slugs, for `search(regions=[...])`. |
+| `cache_status` | Region/venue/item counts *and* the per-product-line breakdown, so a thin result set can be told apart from an uncrawled category. |
+| `get_menu_live` | Live (uncached) menu fetch for one venue slug, for prices right before ordering. Reports whether a failure is permanent (wrong/dead slug) or transient. |
+
+`search` also returns `venue_facets` and `category_facets`; feed those values
+back in as `include_venues` / `categories` to drill down, the same way the web
+UI's sidebar does.
 
 ## How it works under the hood
 
