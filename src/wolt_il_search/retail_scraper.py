@@ -12,11 +12,12 @@ that doesn't also require this same page fetch, so this scraper parses the
 from __future__ import annotations
 
 import json
-import random
 import re
-import time
+from collections.abc import Callable
 
 import requests
+
+from .backoff import AdaptiveThrottle, HttpError, RetryPolicy, request_with_retry
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 _QUERY_STATE_RE = re.compile(
@@ -26,37 +27,46 @@ _CATEGORY_LINK_RE = re.compile(r'href="(/en/isr/[^"]*?/venue/[^"]*?/items/[^"]+)
 
 
 class RetailScraperError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None, permanent: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.permanent = permanent
 
 
 class RetailScraper:
-    def __init__(self, delay_seconds: float = 1.5):
-        self.delay_seconds = delay_seconds
+    def __init__(
+        self,
+        delay_seconds: float = 1.5,
+        policy: RetryPolicy | None = None,
+        on_retry: Callable[[dict], None] | None = None,
+    ):
+        # Pacing/retries are shared with WoltClient via backoff.py, but the
+        # throttle instance is per-client: wolt.com (HTML) and
+        # consumer-api.wolt.com (JSON) rate-limit independently, so one
+        # getting throttled shouldn't slow the other down.
+        self.policy = policy or RetryPolicy(base_delay=delay_seconds)
+        self.throttle = AdaptiveThrottle(self.policy)
+        self.on_retry = on_retry
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": _UA, "Accept-Language": "en"})
-        self._last_request = 0.0
 
-    def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_request
-        wait = self.delay_seconds - elapsed + random.uniform(0, 0.4)
-        if wait > 0:
-            time.sleep(wait)
-        self._last_request = time.monotonic()
+    @property
+    def delay_seconds(self) -> float:
+        return self.throttle.delay
 
     def _get_html(self, url: str) -> str:
-        self._throttle()
         try:
-            resp = self.session.get(url, timeout=25)
-            if resp.status_code == 429:
-                time.sleep(5 + random.uniform(0, 3))
-                self._throttle()
-                resp = self.session.get(url, timeout=25)
-        except requests.exceptions.RequestException as e:
+            resp = request_with_retry(
+                lambda: self.session.get(url, timeout=25),
+                describe=f"GET {url}",
+                policy=self.policy,
+                throttle=self.throttle,
+                on_retry=self.on_retry,
+            )
+        except HttpError as e:
             # Same reasoning as WoltClient._get: don't let one flaky request
             # kill an hours-long unattended crawl.
-            raise RetailScraperError(f"GET {url} -> {e}") from e
-        if not resp.ok:
-            raise RetailScraperError(f"GET {url} -> {resp.status_code}")
+            raise RetailScraperError(str(e), status_code=e.status_code, permanent=e.permanent) from e
         return resp.text
 
     @staticmethod
